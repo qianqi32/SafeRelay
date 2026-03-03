@@ -1,7 +1,11 @@
 /**
  * SafeRelay - Telegram 双向机器人
  * 项目地址: https://github.com/qianqi32/SafeRelay
+<<<<<<< HEAD
+ * 版本: 1.0.2
+=======
  * 版本: 1.0.1
+>>>>>>> bfd009fd837946c85ee04b1bc6eb4d932eb4ec0c
  * 当前版本可能仍不稳定，如遇到 BUG 请提交至 issues
 */
 
@@ -15,8 +19,12 @@ const WEBHOOK = '/endpoint';
 const SECRET = ENV_BOT_SECRET;
 const ADMIN_UID = ENV_ADMIN_UID;
 
-// 验证通过后的有效期 (秒)，默认 30 天
-const VERIFICATION_TTL = 60 * 60 * 24 * 30;
+// 验证通过后的有效期 (秒)，默认 7 天
+const VERIFICATION_TTL = 60 * 60 * 24 * 7;
+
+// 防刷屏配置
+const RATE_LIMIT_WINDOW_MS = 5000; // 5秒窗口
+const RATE_LIMIT_MAX_MSG = 5; // 5秒内最多5条消息
 
 // 防刷屏配置
 const RATE_LIMIT_WINDOW_MS = 5000; // 5秒窗口
@@ -25,6 +33,10 @@ const RATE_LIMIT_MAX_MSG = 5; // 5秒内最多5条消息
 // 联合封禁配置
 const UNION_BAN_API_URL = "https://verify.wzxabc.eu.org";
 const UNION_BAN_CACHE_TTL = 3600 * 24;
+
+// 本地欺诈数据库配置
+const FRAUD_DB_URL = 'https://raw.githubusercontent.com/qianqi32/SafeRelay/main/data/fraud.db';
+const FRAUD_CACHE_TTL = 3600; // 1小时缓存
 
 // 调用联合封禁 API
 async function callUnionBanApi(endpoint, payload) {
@@ -49,29 +61,65 @@ async function callUnionBanApi(endpoint, payload) {
 // 检查用户是否被联合封禁
 async function checkUnionBan(userId) {
     const gbanKey = `gban:${userId}`;
-    
+
     // 1. 检查内存缓存
     let gbanStatus = memGet(gbanKey);
     if (gbanStatus !== undefined) {
         return gbanStatus === "true";
     }
-    
+
     // 2. 检查 KV 缓存
     gbanStatus = await KV.get(gbanKey);
     if (gbanStatus !== null) {
         memSet(gbanKey, gbanStatus, 30 * 60 * 1000);
         return gbanStatus === "true";
     }
-    
+
     // 3. 调用远程 API
     const remoteCheck = await callUnionBanApi('/check_ban', { user_id: String(userId) });
     gbanStatus = (remoteCheck && remoteCheck.banned) ? "true" : "false";
-    
+
     // 写入 KV 缓存
     await KV.put(gbanKey, gbanStatus, { expirationTtl: UNION_BAN_CACHE_TTL });
     memSet(gbanKey, gbanStatus, 30 * 60 * 1000);
-    
+
     return gbanStatus === "true";
+}
+
+// 检查用户是否在欺诈数据库中
+async function checkFraud(userId) {
+    const fraudKey = `fraud:${userId}`;
+
+    // 1. 检查内存缓存
+    let fraudStatus = memGet(fraudKey);
+    if (fraudStatus !== undefined) {
+        return fraudStatus === "true";
+    }
+
+    // 2. 检查 KV 缓存
+    fraudStatus = await KV.get(fraudKey);
+    if (fraudStatus !== null) {
+        memSet(fraudKey, fraudStatus, FRAUD_CACHE_TTL * 1000);
+        return fraudStatus === "true";
+    }
+
+    // 3. 获取欺诈数据库
+    try {
+        const db = await fetch(FRAUD_DB_URL).then(r => r.text());
+        const fraudList = db.split('\n').filter(v => v.trim());
+        const isFraud = fraudList.includes(userId.toString());
+
+        fraudStatus = isFraud ? "true" : "false";
+
+        // 写入 KV 缓存（1小时）
+        await KV.put(fraudKey, fraudStatus, { expirationTtl: FRAUD_CACHE_TTL });
+        memSet(fraudKey, fraudStatus, FRAUD_CACHE_TTL * 1000);
+
+        return isFraud;
+    } catch (err) {
+        console.error('检查欺诈数据库错误:', err);
+        return false;
+    }
 }
 
 // 内存缓存层
@@ -90,13 +138,74 @@ function memGet(key) {
 
 function memSet(key, value, ttlMs = MEMORY_CACHE_TTL) {
     memCache.set(key, { value, expiry: Date.now() + ttlMs });
-    if (memCache.size > 2000) memCache.clear();
+    // 当缓存过大时，清理最旧的 20% 条目
+    if (memCache.size > 2000) {
+        const entriesToDelete = Math.floor(memCache.size * 0.2);
+        const entries = Array.from(memCache.entries());
+        // 按过期时间排序，删除最早过期的
+        entries.sort((a, b) => a[1].expiry - b[1].expiry);
+        for (let i = 0; i < entriesToDelete; i++) {
+            memCache.delete(entries[i][0]);
+        }
+    }
 }
 
 function memDelete(key) {
     memCache.delete(key);
 }
 
+<<<<<<< HEAD
+// 检查用户是否已验证（优先使用内存缓存）
+async function isUserVerified(userId) {
+    const verifiedKey = 'verified-' + userId;
+
+    // 1. 先检查内存缓存
+    const memVerified = memGet(verifiedKey);
+    if (memVerified !== undefined) {
+        return memVerified === "true";
+    }
+
+    // 2. 检查 KV
+    const kvVerified = await KV.get(verifiedKey);
+    if (kvVerified === 'true') {
+        // 更新内存缓存
+        memSet(verifiedKey, 'true', 5 * 60 * 1000);
+        return true;
+    }
+
+    return false;
+}
+
+// 获取所有白名单用户
+async function getWhitelist() {
+    const whitelistData = await KV.get('whitelist-data');
+    return whitelistData ? whitelistData.split(',').filter(v => v) : [];
+}
+
+// 检查用户是否在白名单中
+async function isWhitelisted(userId) {
+    const whitelist = await getWhitelist();
+    return whitelist.includes(userId);
+}
+
+// 添加用户到白名单
+async function addToWhitelist(userId) {
+    const whitelist = await getWhitelist();
+    if (!whitelist.includes(userId)) {
+        whitelist.push(userId);
+        await KV.put('whitelist-data', whitelist.join(','));
+    }
+}
+
+// 从白名单移除用户
+async function removeFromWhitelist(userId) {
+    const whitelist = await getWhitelist();
+    const newWhitelist = whitelist.filter(id => id !== userId);
+    await KV.put('whitelist-data', newWhitelist.join(','));
+}
+
+=======
+>>>>>>> bfd009fd837946c85ee04b1bc6eb4d932eb4ec0c
 // 防刷屏限流器
 const rateLimitCache = new Map();
 
@@ -129,6 +238,32 @@ function checkRateLimit(userId) {
     return { allowed: true, remaining: RATE_LIMIT_MAX_MSG - userData.count };
 }
 
+<<<<<<< HEAD
+// 已验证用户列表管理（新版：同时保存用户ID和昵称）
+async function addVerifiedUser(userId, userInfo = null) {
+    const key = 'verified_users_list_v2';
+    try {
+        // 确保用户ID是字符串
+        const userIdStr = String(userId);
+
+        const users = await KV.get(key);
+        const userMap = users ? new Map(JSON.parse(users)) : new Map();
+
+        // 获取用户昵称
+        let userName = userInfo;
+        if (!userName) {
+            // 尝试从已有数据获取
+            const existing = userMap.get(userIdStr);
+            if (existing) userName = existing;
+        }
+        if (!userName) userName = 'Unknown';
+
+        // 只有新用户或昵称变化才更新
+        const existing = userMap.get(userIdStr);
+        if (!existing || existing !== userName) {
+            userMap.set(userIdStr, userName);
+            await KV.put(key, JSON.stringify([...userMap]));
+=======
 // 已验证用户列表管理
 async function addVerifiedUser(userId) {
     const key = 'verified_users_list';
@@ -140,6 +275,7 @@ async function addVerifiedUser(userId) {
         if (!userSet.has(userId)) {
             userSet.add(userId);
             await KV.put(key, JSON.stringify([...userSet]));
+>>>>>>> bfd009fd837946c85ee04b1bc6eb4d932eb4ec0c
         }
     } catch (e) {
         console.error('Failed to add verified user:', e);
@@ -147,6 +283,20 @@ async function addVerifiedUser(userId) {
 }
 
 async function removeVerifiedUser(userId) {
+<<<<<<< HEAD
+    const key = 'verified_users_list_v2';
+    try {
+        // 确保用户ID是字符串
+        const userIdStr = String(userId);
+
+        const users = await KV.get(key);
+        if (!users) return;
+
+        const userMap = new Map(JSON.parse(users));
+        if (userMap.has(userIdStr)) {
+            userMap.delete(userIdStr);
+            await KV.put(key, JSON.stringify([...userMap]));
+=======
     const key = 'verified_users_list';
     try {
         const users = await KV.get(key);
@@ -156,6 +306,7 @@ async function removeVerifiedUser(userId) {
         if (userSet.has(userId)) {
             userSet.delete(userId);
             await KV.put(key, JSON.stringify([...userSet]));
+>>>>>>> bfd009fd837946c85ee04b1bc6eb4d932eb4ec0c
         }
     } catch (e) {
         console.error('Failed to remove verified user:', e);
@@ -163,10 +314,26 @@ async function removeVerifiedUser(userId) {
 }
 
 async function getAllVerifiedUsers() {
+<<<<<<< HEAD
+    const key = 'verified_users_list_v2';
+    try {
+        const users = await KV.get(key);
+        if (!users) {
+            return [];
+        }
+        // 确保所有key都是字符串
+        const parsed = JSON.parse(users);
+        const normalizedMap = new Map();
+        for (const [k, v] of parsed) {
+            normalizedMap.set(String(k), v);
+        }
+        return [...normalizedMap];
+=======
     const key = 'verified_users_list';
     try {
         const users = await KV.get(key);
         return users ? JSON.parse(users) : [];
+>>>>>>> bfd009fd837946c85ee04b1bc6eb4d932eb4ec0c
     } catch (e) {
         console.error('Failed to get verified users:', e);
         return [];
@@ -219,21 +386,24 @@ async function getVerifiedUsers() {
     return await getAllVerifiedUsers();
 }
 
-// 分批广播消息
-async function broadcastMessage(text, offset = 0, batchSize = 30) {
+// 分批广播辅助函数（参考 RelayGo 实现）
+async function sendBroadcastBatch(broadcastMsg, offset, batchSize) {
     const users = await getVerifiedUsers();
     const total = users.length;
-    
-    if (total === 0) {
-        return { sent: 0, failed: 0, total: 0, skipped: 0, hasMore: false };
-    }
-    
     const batch = users.slice(offset, offset + batchSize);
-    let sent = 0;
-    let failed = 0;
-    let skipped = 0;
+    
+    let sent = 0, failed = 0, skipped = 0;
+    const startTime = Date.now();
+    const maxDuration = 25000; // 25秒超时
+    let timedOut = false;
     
     for (const userId of batch) {
+        // 超时检查
+        if (Date.now() - startTime > maxDuration) {
+            timedOut = true;
+            break;
+        }
+        
         // 检查用户是否被封禁
         const isBlocked = await KV.get('blocked-' + userId);
         if (isBlocked) {
@@ -244,30 +414,32 @@ async function broadcastMessage(text, offset = 0, batchSize = 30) {
         try {
             const result = await sendMessage({
                 chat_id: userId,
-                text: text,
+                text: broadcastMsg,
                 parse_mode: 'HTML'
             });
-            
-            if (result.ok) {
-                sent++;
-            } else {
-                failed++;
-            }
+            if (result.ok) sent++;
+            else failed++;
         } catch (e) {
             failed++;
         }
+        
+        // 每25条消息暂停1秒，避免触发限制
+        if ((sent + failed) % 25 === 0) {
+            await new Promise(r => setTimeout(r, 1000));
+        }
     }
     
-    const nextOffset = offset + batchSize;
-    const hasMore = nextOffset < total;
+    const processed = offset + sent + skipped;
+    const hasMore = processed < total && !timedOut;
     
     return {
-        sent,
+        sent: offset + sent,
         failed,
         skipped,
         total,
         hasMore,
-        nextOffset: hasMore ? nextOffset : null
+        nextOffset: processed,
+        timedOut
     };
 }
 
@@ -398,6 +570,29 @@ function forwardMessage(msg) {
   return requestTelegram('forwardMessage', msg);
 }
 
+// 设置 Telegram 命令列表
+async function setBotCommands() {
+  const adminCommands = [
+    { command: 'help', description: '显示帮助信息' },
+    { command: 'menu', description: '打开图形管理菜单' },
+    { command: 'bcancel', description: '取消进行中的广播' },
+    { command: 'listwhite', description: '列出所有白名单用户' },
+    { command: 'welcome', description: '设置欢迎消息' },
+    { command: 'autoreply', description: '设置自动回复消息' }
+  ];
+
+  try {
+    // 为管理员设置命令列表
+    await requestTelegram('setMyCommands', {
+      commands: adminCommands,
+      scope: { type: 'chat', chat_id: ADMIN_UID }
+    });
+    console.log('✅ 管理员命令列表已设置');
+  } catch (e) {
+    console.error('设置命令列表失败:', e);
+  }
+}
+
 addEventListener('fetch', event => {
   const url = new URL(event.request.url);
   if (url.pathname === WEBHOOK) {
@@ -448,6 +643,36 @@ async function onMessage(message, origin) {
 
   // 2. 如果是访客 (普通用户)
   else {
+    const text = (message.text || '').trim();
+
+    // 0. 检查白名单（白名单用户跳过所有检查）
+    const whitelisted = await isWhitelisted(chatId);
+    if (whitelisted) {
+      // 白名单用户处理 /start 或直接转发
+      if (text === '/start') {
+        return sendMessage({
+          chat_id: chatId,
+          text: '👋 欢迎使用 SafeRelay！\n\n您已在白名单中，可以直接发送消息给管理员。'
+        });
+      }
+      return handleGuestMessage(message);
+    }
+
+    // 处理 /start 命令
+    if (text === '/start') {
+      // 检查是否已验证
+      const isVerified = await isUserVerified(chatId);
+      if (isVerified) {
+        return sendMessage({
+          chat_id: chatId,
+          text: '👋 欢迎使用 SafeRelay！\n\n您已通过验证，可以直接发送消息给管理员。'
+        });
+      } else {
+        // 未验证，进入验证流程
+        return handleVerification(message, chatId, origin);
+      }
+    }
+
     // 0. 检查联合封禁（如果开启）
     const unionBanEnabled = await getConfig(CONFIG_KEYS.UNION_BAN, '0');
     if (unionBanEnabled === '1' || unionBanEnabled === 'true') {
@@ -461,7 +686,23 @@ async function onMessage(message, origin) {
       }
     }
 
-    // 1. 检查本地黑名单（直接读取KV，避免缓存不一致）
+    // 1. 检查欺诈数据库
+    const isFraud = await checkFraud(chatId);
+    if (isFraud) {
+      // 通知管理员
+      await sendMessage({
+        chat_id: ADMIN_UID,
+        text: `🚨 <b>检测到欺诈用户</b>\n\nUID: <code>${chatId}</code>\n该用户出现在欺诈数据库中，已自动拦截。`,
+        parse_mode: 'HTML'
+      });
+      return sendMessage({
+        chat_id: chatId,
+        text: '🚫 <b>服务不可用</b>\n\n您的账号存在异常，无法使用本服务。',
+        parse_mode: 'HTML'
+      });
+    }
+
+    // 2. 检查本地黑名单（直接读取KV，避免缓存不一致）
     const isBlocked = await KV.get('blocked-' + chatId);
     if (isBlocked) {
       // 被拉黑了，回复提示
@@ -471,11 +712,15 @@ async function onMessage(message, origin) {
       });
     }
 
-    // 2. 检查是否已通过验证（直接读取KV，避免缓存不一致）
-    const isVerified = await KV.get('verified-' + chatId);
+    // 3. 检查是否已通过验证（优先使用内存缓存）
+    const isVerified = await isUserVerified(chatId);
 
     if (isVerified) {
+<<<<<<< HEAD
+      // 4. 检查防刷屏限制
+=======
       // 3. 检查防刷屏限制
+>>>>>>> bfd009fd837946c85ee04b1bc6eb4d932eb4ec0c
       const rateLimit = checkRateLimit(chatId);
       if (!rateLimit.allowed) {
         return sendMessage({
@@ -486,11 +731,19 @@ async function onMessage(message, origin) {
       
       // 已验证，发送自动回复（如果设置了）
       const autoReplyMsg = await getConfig(CONFIG_KEYS.AUTO_REPLY_MSG);
-      if (autoReplyMsg && message.text === '/start') {
-        await sendMessage({
-          chat_id: chatId,
-          text: autoReplyMsg
-        });
+      if (autoReplyMsg) {
+        // 检查自动回复冷却时间（10分钟）
+        const autoReplyKey = `autoreply:${chatId}`;
+        const lastReply = await KV.get(autoReplyKey);
+        
+        if (!lastReply) {
+          await sendMessage({
+            chat_id: chatId,
+            text: autoReplyMsg
+          });
+          // 记录发送时间，10分钟后过期
+          await KV.put(autoReplyKey, '1', { expirationTtl: 600 });
+        }
       }
       // 正常转发给管理员
       return handleGuestMessage(message);
@@ -512,15 +765,22 @@ async function onEditedMessage(message, origin) {
 
   // 2. 如果是访客 (普通用户) 编辑消息
   else {
-    // 0. 检查黑名单
+    // 0. 检查白名单（白名单用户跳过所有检查）
+    const whitelisted = await isWhitelisted(chatId);
+    if (whitelisted) {
+      // 白名单用户直接处理编辑
+      return handleGuestEditedMessage(message);
+    }
+
+    // 1. 检查黑名单
     const isBlocked = await KV.get('blocked-' + chatId);
     if (isBlocked) {
       // 被拉黑了，忽略编辑
       return;
     }
 
-    // 1. 检查是否已通过验证
-    const isVerified = await KV.get('verified-' + chatId);
+    // 2. 检查是否已通过验证（优先使用内存缓存）
+    const isVerified = await isUserVerified(chatId);
 
     if (isVerified) {
       // 已验证，转发编辑后的消息
@@ -556,6 +816,52 @@ async function getTargetId(message, commandName) {
   return null;
 }
 
+// 获取已验证用户列表（支持分页）
+async function getVerifiedUsers(page = 1, pageSize = 10) {
+  // 获取所有已验证用户（会自动处理新旧版本迁移）
+  const allUsers = await getAllVerifiedUsers();
+
+  if (!allUsers || allUsers.length === 0) {
+    return { users: [], total: 0, totalPages: 0 };
+  }
+
+  try {
+    const total = allUsers.length;
+    const totalPages = Math.ceil(total / pageSize);
+
+    // 确保页码有效
+    page = Math.max(1, Math.min(page, totalPages || 1));
+
+    const start = (page - 1) * pageSize;
+    const end = start + pageSize;
+    const users = allUsers.slice(start, end);
+
+    // 获取每个用户的详细信息
+    const userDetails = [];
+    for (const [userId, userName] of users) {
+      const blocked = await KV.get('blocked-' + userId);
+      const whitelisted = await isWhitelisted(userId);
+      userDetails.push({
+        id: userId,
+        name: userName || 'Unknown',
+        blocked: blocked === 'true',
+        whitelisted: whitelisted
+      });
+    }
+
+    return {
+      users: userDetails,
+      total,
+      page,
+      totalPages,
+      pageSize
+    };
+  } catch (e) {
+    console.error('获取用户列表错误:', e);
+    return { users: [], total: 0, totalPages: 0 };
+  }
+}
+
 // 生成主菜单
 async function generateMainMenu() {
   const welcomeMsg = await getConfig(CONFIG_KEYS.WELCOME_MSG);
@@ -578,7 +884,8 @@ async function generateMainMenu() {
   const keyboard = {
     inline_keyboard: [
       [{ text: '🌐 联合封禁', callback_data: 'submenu_union' }, { text: '📊 统计信息', callback_data: 'submenu_stats' }],
-      [{ text: '👋 欢迎消息', callback_data: 'submenu_welcome' }, { text: '🤖 自动回复', callback_data: 'submenu_autoreply' }]
+      [{ text: '👋 欢迎消息', callback_data: 'submenu_welcome' }, { text: '🤖 自动回复', callback_data: 'submenu_autoreply' }],
+      [{ text: '👥 用户管理', callback_data: 'submenu_users' }]
     ]
   };
 
@@ -664,7 +971,7 @@ async function generateAutoreplySubmenu() {
 async function generateStatsSubmenu() {
   const stats = await getStats();
   const today = new Date().toISOString().split('T')[0];
-  
+
   const text = `📊 <b>统计信息</b>
 
 📅 <b>今日数据 (${today})</b>
@@ -679,6 +986,68 @@ async function generateStatsSubmenu() {
   const keyboard = {
     inline_keyboard: [
       [{ text: '🔄 刷新数据', callback_data: 'refresh_stats' }],
+      [{ text: '◀️ 返回主菜单', callback_data: 'back_to_main' }]
+    ]
+  };
+
+  return { text, reply_markup: keyboard };
+}
+
+// 生成用户管理子菜单
+async function generateUsersSubmenu(page = 1) {
+  const result = await getVerifiedUsers(page, 10);
+
+  if (result.total === 0) {
+    const text = `👥 <b>用户管理</b>
+
+暂无已验证用户。
+
+💡 用户使用 /start 并通过验证后会出现在这里。`;
+
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: '🔄 刷新', callback_data: 'refresh_users:1' }],
+        [{ text: '◀️ 返回主菜单', callback_data: 'back_to_main' }]
+      ]
+    };
+
+    return { text, reply_markup: keyboard };
+  }
+
+  let userList = '';
+  for (const user of result.users) {
+    const status = user.blocked ? '🚫' : (user.whitelisted ? '⭐' : '✅');
+    const name = user.name !== 'Unknown' ? ` (${escapeHtml(user.name)})` : '';
+    userList += `${status} <code>${user.id}</code>${name}\n`;
+  }
+
+  const text = `👥 <b>用户管理</b>
+
+📊 <b>统计:</b> 共 ${result.total} 位用户 | 第 ${result.page}/${result.totalPages} 页
+
+<b>用户列表:</b>
+${userList}
+<b>图例:</b> ✅正常 ⭐白名单 🚫已拉黑
+
+💡 <b>操作提示:</b>
+• 点击用户ID可复制
+• 使用指令管理用户:
+  /block, /unblock, /clear_ver
+  /addwhite, /removewhite`;
+
+  // 构建分页按钮
+  const paginationButtons = [];
+  if (result.page > 1) {
+    paginationButtons.push({ text: '◀️ 上一页', callback_data: `users_page:${result.page - 1}` });
+  }
+  paginationButtons.push({ text: '🔄 刷新', callback_data: `refresh_users:${result.page}` });
+  if (result.page < result.totalPages) {
+    paginationButtons.push({ text: '▶️ 下一页', callback_data: `users_page:${result.page + 1}` });
+  }
+
+  const keyboard = {
+    inline_keyboard: [
+      paginationButtons,
       [{ text: '◀️ 返回主菜单', callback_data: 'back_to_main' }]
     ]
   };
@@ -754,6 +1123,47 @@ async function handleAdminCallback(callbackQuery) {
     return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id });
   }
 
+  // 用户管理 - 进入子菜单
+  if (data === 'submenu_users') {
+    const menu = await generateUsersSubmenu(1);
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id });
+  }
+
+  // 用户管理 - 翻页
+  if (data.startsWith('users_page:')) {
+    const page = parseInt(data.split(':')[1]) || 1;
+    const menu = await generateUsersSubmenu(page);
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id, text: `第 ${page} 页` });
+  }
+
+  // 用户管理 - 刷新
+  if (data.startsWith('refresh_users:')) {
+    const page = parseInt(data.split(':')[1]) || 1;
+    const menu = await generateUsersSubmenu(page);
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id, text: '已刷新' });
+  }
+
   // 联合封禁 - 切换状态
   if (data === 'toggle_union') {
     const currentVal = await getConfig(CONFIG_KEYS.UNION_BAN, '0');
@@ -811,6 +1221,56 @@ async function handleAdminCallback(callbackQuery) {
     });
     return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id, text: '已刷新' });
   }
+
+  // 广播控制按钮
+  if (data.startsWith('bcontinue:')) {
+    const offset = parseInt(data.split(':')[1]) || 0;
+    const broadcastMsg = await KV.get(`broadcast_msg:${ADMIN_UID}`);
+
+    if (!broadcastMsg) {
+      await requestTelegram('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        text: '❌ 广播消息已过期或被取消',
+        parse_mode: 'HTML'
+      });
+      return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id, text: '广播已过期' });
+    }
+
+    // 先回复按钮，避免超时
+    await requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id, text: '正在发送...' });
+
+    const result = await sendBroadcastBatch(broadcastMsg, offset, 500);
+    const statusIcon = result.timedOut ? '⚠️' : '✅';
+    const statusText = result.timedOut ? '部分完成（超时）' : '完成';
+
+    // 构建按钮
+    const inlineKeyboard = [];
+    if (result.hasMore) {
+      inlineKeyboard.push([{ text: '▶️ 继续发送', callback_data: `bcontinue:${result.nextOffset}` }]);
+    }
+    inlineKeyboard.push([{ text: '❌ 取消广播', callback_data: 'bcancel' }]);
+
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: `${statusIcon} <b>广播${statusText}</b>\n\n✅ 已发送：${result.sent}/${result.total}\n❌ 失败：${result.failed}${result.skipped > 0 ? `\n⏭️ 跳过（封禁）：${result.skipped}` : ''}`,
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: inlineKeyboard }
+    });
+    return;
+  }
+
+  if (data === 'bcancel') {
+    await KV.delete(`broadcast_msg:${ADMIN_UID}`);
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: '✅ 已取消广播',
+      parse_mode: 'HTML'
+    });
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id, text: '已取消' });
+  }
 }
 
 // HTML 转义
@@ -825,6 +1285,32 @@ async function handleAdminMessage(message) {
   const reply = message.reply_to_message;
 
   // --- 管理指令区域 ---
+
+  // 指令：/help - 显示帮助信息
+  if (text === '/help') {
+    return sendMessage({
+      chat_id: ADMIN_UID,
+      text: '🤖 <b>SafeRelay 管理面板</b>\n\n' +
+            '<b>常用指令：</b>\n' +
+            '/menu - 打开图形菜单\n' +
+            '/help - 显示此帮助信息\n' +
+            '/broadcast - 广播消息（24h冷却）\n' +
+            '/bcancel - 取消广播\n\n' +
+            '<b>用户管理（回复消息或指定ID）：</b>\n' +
+            '/block - 拉黑用户\n' +
+            '/unblock - 解封用户\n' +
+            '/clear_ver - 重置验证\n' +
+            '/addwhite - 添加白名单\n' +
+            '/removewhite - 移除白名单\n' +
+            '/checkwhite - 检查白名单\n' +
+            '/listwhite - 白名单列表\n\n' +
+            '<b>消息设置：</b>\n' +
+            '/welcome - 设置欢迎消息\n' +
+            '/autoreply - 设置自动回复\n\n' +
+            '<b>快捷操作：</b> 直接回复用户消息即可转发',
+      parse_mode: 'HTML'
+    });
+  }
 
   // 指令：/menu - 显示管理菜单
   if (text === '/menu') {
@@ -904,6 +1390,15 @@ async function handleAdminMessage(message) {
   if (text.startsWith('/clear_ver')) {
     const targetId = await getTargetId(message, '/clear_ver');
     if (targetId) {
+      // 检查用户是否在白名单中
+      const isWhite = await isWhitelisted(targetId);
+      if (isWhite) {
+        return sendMessage({ 
+          chat_id: ADMIN_UID, 
+          text: `⚠️ 用户 ${targetId} 在白名单中，无需验证即可发送消息。\n\n如需限制该用户，请先使用 /removewhite ${targetId} 移除白名单。` 
+        });
+      }
+      
       await KV.delete('verified-' + targetId);
       memDelete('verified-' + targetId); // 清除缓存
       await removeVerifiedUser(targetId); // 从已验证列表移除
@@ -914,67 +1409,102 @@ async function handleAdminMessage(message) {
   }
 
   // 指令：/broadcast - 广播消息
-  if (text.startsWith('/broadcast')) {
-    const content = text.slice(10).trim();
-    if (!content) {
+  if (text === '/broadcast' || text.startsWith('/broadcast ')) {
+    const broadcastMsg = text === '/broadcast' ? '' : text.slice(10).trim();
+    if (!broadcastMsg) {
       return sendMessage({
         chat_id: ADMIN_UID,
-        text: '📢 <b>广播功能</b>\n\n用法：\n<code>/broadcast 消息内容</code>\n\n支持 HTML 格式\n发送 /bcancel 取消进行中的广播',
-        parse_mode: 'HTML'
+        text: '⚠️ 格式错误。\n用法：/broadcast 消息内容\n\n支持 HTML 格式：\n<b>粗体</b> <i>斜体</i> <code>代码</code>'
       });
     }
-    
-    // 保存广播消息到 KV
-    await KV.put(`broadcast:${ADMIN_UID}`, JSON.stringify({
-      text: content,
-      offset: 0,
-      status: 'pending'
-    }));
-    
-    return sendMessage({
-      chat_id: ADMIN_UID,
-      text: '📢 广播消息已保存。\n发送 /bstart 开始广播\n发送 /bcancel 取消',
-      parse_mode: 'HTML'
-    });
-  }
 
-  // 指令：/bstart - 开始广播
-  if (text === '/bstart') {
-    const broadcastData = await KV.get(`broadcast:${ADMIN_UID}`);
-    if (!broadcastData) {
-      return sendMessage({
-        chat_id: ADMIN_UID,
-        text: '⚠️ 没有待发送的广播消息。请先使用 /broadcast 设置内容。'
-      });
+    // 检查24小时冷却
+    const lastBroadcast = await KV.get(`broadcast_cooldown:${ADMIN_UID}`);
+    if (lastBroadcast) {
+      const lastTime = parseInt(lastBroadcast);
+      const now = Date.now();
+      const cooldownMs = 24 * 60 * 60 * 1000; // 24小时
+      const remainingMs = cooldownMs - (now - lastTime);
+      
+      if (remainingMs > 0) {
+        const remainingHours = Math.ceil(remainingMs / (60 * 60 * 1000));
+        return sendMessage({
+          chat_id: ADMIN_UID,
+          text: `⏳ 广播冷却中，请 ${remainingHours} 小时后再试。`
+        });
+      }
     }
-    
-    const { text: broadcastText, offset = 0 } = JSON.parse(broadcastData);
-    const result = await broadcastMessage(broadcastText, offset);
-    
-    // 更新广播状态
+
+    // 保存消息到 KV（24小时过期）
+    await KV.put(`broadcast_msg:${ADMIN_UID}`, broadcastMsg, { expirationTtl: 86400 });
+    // 记录广播时间
+    await KV.put(`broadcast_cooldown:${ADMIN_UID}`, Date.now().toString(), { expirationTtl: 86400 });
+
+    // 发送第一批（500人）
+    const result = await sendBroadcastBatch(broadcastMsg, 0, 500);
+    const statusIcon = result.timedOut ? '⚠️' : '✅';
+    const statusText = result.timedOut ? '部分完成（超时）' : '完成';
+
+    // 构建按钮
+    const inlineKeyboard = [];
     if (result.hasMore) {
-      await KV.put(`broadcast:${ADMIN_UID}`, JSON.stringify({
-        text: broadcastText,
-        offset: result.nextOffset,
-        status: 'pending'
-      }));
-    } else {
-      await KV.delete(`broadcast:${ADMIN_UID}`);
+      inlineKeyboard.push([{ text: '▶️ 继续发送', callback_data: `bcontinue:${result.nextOffset}` }]);
     }
-    
-    const statusIcon = result.failed === 0 ? '✅' : '⚠️';
-    const statusText = result.hasMore ? '进行中' : '已完成';
-    
+    inlineKeyboard.push([{ text: '❌ 取消广播', callback_data: 'bcancel' }]);
+
     return sendMessage({
       chat_id: ADMIN_UID,
-      text: `${statusIcon} <b>广播${statusText}</b>\n\n✅ 已发送：${result.sent}/${result.total}\n❌ 失败：${result.failed}${result.skipped > 0 ? `\n⏭️ 跳过（封禁）：${result.skipped}` : ''}${result.hasMore ? `\n\n继续发送：/bstart` : ''}`,
-      parse_mode: 'HTML'
+      text: `${statusIcon} <b>广播${statusText}</b>\n\n✅ 已发送：${result.sent}/${result.total}\n❌ 失败：${result.failed}${result.skipped > 0 ? `\n⏭️ 跳过（封禁）：${result.skipped}` : ''}`,
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: inlineKeyboard }
     });
   }
 
-  // 指令：/bcancel - 取消广播
+  // 指令：/addwhite [ID] - 添加白名单
+  if (text.startsWith('/addwhite')) {
+    const targetId = await getTargetId(message, '/addwhite');
+    if (targetId) {
+      await addToWhitelist(targetId);
+      return sendMessage({ chat_id: ADMIN_UID, text: `✅ 用户 ${targetId} 已添加到白名单。` });
+    } else {
+      return sendMessage({ chat_id: ADMIN_UID, text: '⚠️ 格式错误。\n请回复用户消息发送 /addwhite\n或发送 /addwhite 123456 (必须是数字 ID)' });
+    }
+  }
+
+  // 指令：/removewhite [ID] - 移除白名单
+  if (text.startsWith('/removewhite')) {
+    const targetId = await getTargetId(message, '/removewhite');
+    if (targetId) {
+      await removeFromWhitelist(targetId);
+      return sendMessage({ chat_id: ADMIN_UID, text: `✅ 用户 ${targetId} 已从白名单移除。` });
+    } else {
+      return sendMessage({ chat_id: ADMIN_UID, text: '⚠️ 格式错误。\n请回复用户消息发送 /removewhite\n或发送 /removewhite 123456 (必须是数字 ID)' });
+    }
+  }
+
+  // 指令：/checkwhite [ID] - 检查白名单状态
+  if (text.startsWith('/checkwhite')) {
+    const targetId = await getTargetId(message, '/checkwhite');
+    if (targetId) {
+      const isWhite = await isWhitelisted(targetId);
+      return sendMessage({ chat_id: ADMIN_UID, text: `UID: ${targetId} ${isWhite ? '✅ 在白名单中' : '❌ 不在白名单中'}` });
+    } else {
+      return sendMessage({ chat_id: ADMIN_UID, text: '⚠️ 格式错误。\n请回复用户消息发送 /checkwhite\n或发送 /checkwhite 123456 (必须是数字 ID)' });
+    }
+  }
+
+  // 指令：/listwhite - 列出所有白名单用户
+  if (text === '/listwhite') {
+    const whitelist = await getWhitelist();
+    if (whitelist.length === 0) {
+      return sendMessage({ chat_id: ADMIN_UID, text: '📋 白名单为空' });
+    }
+    return sendMessage({ chat_id: ADMIN_UID, text: `📋 白名单用户列表 (共 ${whitelist.length} 个):\n${whitelist.join('\n')}` });
+  }
+
+  // 指令：/bcancel - 取消广播（保留命令方式作为备选）
   if (text === '/bcancel') {
-    await KV.delete(`broadcast:${ADMIN_UID}`);
+    await KV.delete(`broadcast_msg:${ADMIN_UID}`);
     return sendMessage({
       chat_id: ADMIN_UID,
       text: '✅ 已取消广播'
@@ -1019,10 +1549,11 @@ async function handleAdminMessage(message) {
       });
     }
   } else {
-    // 既不是指令也不是回复
+    // 既不是指令也不是回复，提示使用 /help
     return sendMessage({
       chat_id: ADMIN_UID,
-      text: '🤖 管理面板\n\n/menu - 打开图形菜单\n/broadcast - 广播消息\n回复消息 = 发送给用户\n回复并发送 /block = 拉黑\n回复并发送 /unblock = 解封\n回复并发送 /clear_ver = 重置验证'
+      text: '🤖 请发送 /help 查看所有可用指令，或直接回复用户消息进行转发。',
+      parse_mode: 'HTML'
     });
   }
 }
@@ -1346,11 +1877,30 @@ function handleVerifyPage(request) {
             // 显示加载状态
             document.getElementById('verify-section').classList.add('hidden');
             document.getElementById('loading-msg').classList.remove('hidden');
+<<<<<<< HEAD
+
+            // 获取用户信息
+            let userInfo = null;
+            try {
+                if (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) {
+                    const user = tg.initDataUnsafe.user;
+                    userInfo = {
+                        id: user.id,
+                        first_name: user.first_name || '',
+                        last_name: user.last_name || '',
+                        username: user.username || ''
+                    };
+                }
+            } catch (e) {
+                console.log('获取用户信息失败:', e);
+            }
+=======
+>>>>>>> bfd009fd837946c85ee04b1bc6eb4d932eb4ec0c
 
             fetch('/verify-callback', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ token, uid })
+                body: JSON.stringify({ token, uid, userInfo })
             })
             .then(response => {
                 if (response.ok) {
@@ -1399,7 +1949,7 @@ async function handleVerifyCallback(request) {
   }
 
   try {
-    const { token, uid } = await request.json();
+    const { token, uid, userInfo } = await request.json();
 
     if (!token || !uid) {
       return new Response('Missing token or uid', { status: 400 });
@@ -1418,16 +1968,47 @@ async function handleVerifyCallback(request) {
 
     if (result.success) {
       // 验证通过！写入 KV
+<<<<<<< HEAD
+      const verifiedKey = 'verified-' + String(uid);
+      await KV.put(verifiedKey, 'true', { expirationTtl: VERIFICATION_TTL });
+      memSet(verifiedKey, 'true', 5 * 60 * 1000); // 更新缓存
+
+      // 构建用户显示名称
+      let displayName = 'Unknown';
+      if (userInfo) {
+        if (userInfo.first_name || userInfo.last_name) {
+          displayName = `${userInfo.first_name || ''} ${userInfo.last_name || ''}`.trim();
+        } else if (userInfo.username) {
+          displayName = `@${userInfo.username}`;
+        }
+      }
+
+      // 添加到已验证用户列表（带昵称）
+      await addVerifiedUser(uid, displayName);
+=======
       await KV.put('verified-' + uid, 'true', { expirationTtl: VERIFICATION_TTL });
       memSet('verified-' + uid, 'true', 5 * 60 * 1000); // 更新缓存
       
       // 添加到已验证用户列表
       await addVerifiedUser(uid);
+>>>>>>> bfd009fd837946c85ee04b1bc6eb4d932eb4ec0c
 
       // 主动通知用户验证成功
       await sendMessage({
         chat_id: uid,
-        text: '✅ 验证通过！您可以直接发送消息给管理员了。'
+        text: '✅ 验证通过！\n\n请等待 3-5 秒后再发送消息，以确保验证状态同步。'
+      });
+
+      // 通知管理员有新用户验证
+      await sendMessage({
+        chat_id: ADMIN_UID,
+        text: `✅ <b>新用户验证通过</b>
+
+UID: <code>${uid}</code>
+昵称: ${escapeHtml(displayName)}
+
+用户现在可以发送消息了。`,
+        parse_mode: 'HTML'
       });
 
       return new Response(JSON.stringify({ success: true }), {
@@ -1617,6 +2198,12 @@ async function handleAdminEditedMessage(message) {
 async function registerWebhook(event, requestUrl, suffix, secret) {
   const webhookUrl = `${requestUrl.protocol}//${requestUrl.hostname}${suffix}`;
   const r = await (await fetch(apiUrl('setWebhook', { url: webhookUrl, secret_token: secret }))).json();
+
+  // 注册 Webhook 成功后设置命令列表
+  if ('ok' in r && r.ok) {
+    await setBotCommands();
+  }
+
   return new Response('ok' in r && r.ok ? 'Ok' : JSON.stringify(r, null, 2));
 }
 

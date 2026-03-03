@@ -6,7 +6,7 @@
 
 1. **Telegram Bot Token**：在 TG 上找 [@BotFather](https://t.me/BotFather) 创建机器人获取。
 2. **Admin UID**：在 TG 上找 [@userinfobot](https://t.me/userinfobot) 获取你自己的 User ID。
-3. **Secret**：生成一个随机字符串（用于 Webhook 验证）。
+3. **生成 Webhook 密钥**：访问 [UUID 生成器](https://www.uuidgenerator.net/) 生成一个随机 UUID 作为 SECRET。
 
 ## 二、创建 KV
 
