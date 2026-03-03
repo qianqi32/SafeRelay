@@ -1,11 +1,7 @@
 /**
  * SafeRelay - Telegram 双向机器人
  * 项目地址: https://github.com/qianqi32/SafeRelay
-<<<<<<< HEAD
  * 版本: 1.0.2
-=======
- * 版本: 1.0.1
->>>>>>> bfd009fd837946c85ee04b1bc6eb4d932eb4ec0c
  * 当前版本可能仍不稳定，如遇到 BUG 请提交至 issues
 */
 
@@ -21,10 +17,6 @@ const ADMIN_UID = ENV_ADMIN_UID;
 
 // 验证通过后的有效期 (秒)，默认 7 天
 const VERIFICATION_TTL = 60 * 60 * 24 * 7;
-
-// 防刷屏配置
-const RATE_LIMIT_WINDOW_MS = 5000; // 5秒窗口
-const RATE_LIMIT_MAX_MSG = 5; // 5秒内最多5条消息
 
 // 防刷屏配置
 const RATE_LIMIT_WINDOW_MS = 5000; // 5秒窗口
@@ -154,7 +146,6 @@ function memDelete(key) {
     memCache.delete(key);
 }
 
-<<<<<<< HEAD
 // 检查用户是否已验证（优先使用内存缓存）
 async function isUserVerified(userId) {
     const verifiedKey = 'verified-' + userId;
@@ -204,8 +195,6 @@ async function removeFromWhitelist(userId) {
     await KV.put('whitelist-data', newWhitelist.join(','));
 }
 
-=======
->>>>>>> bfd009fd837946c85ee04b1bc6eb4d932eb4ec0c
 // 防刷屏限流器
 const rateLimitCache = new Map();
 
@@ -238,7 +227,6 @@ function checkRateLimit(userId) {
     return { allowed: true, remaining: RATE_LIMIT_MAX_MSG - userData.count };
 }
 
-<<<<<<< HEAD
 // 已验证用户列表管理（新版：同时保存用户ID和昵称）
 async function addVerifiedUser(userId, userInfo = null) {
     const key = 'verified_users_list_v2';
@@ -263,19 +251,6 @@ async function addVerifiedUser(userId, userInfo = null) {
         if (!existing || existing !== userName) {
             userMap.set(userIdStr, userName);
             await KV.put(key, JSON.stringify([...userMap]));
-=======
-// 已验证用户列表管理
-async function addVerifiedUser(userId) {
-    const key = 'verified_users_list';
-    try {
-        const users = await KV.get(key);
-        const userSet = users ? new Set(JSON.parse(users)) : new Set();
-        
-        // 只有新用户才更新
-        if (!userSet.has(userId)) {
-            userSet.add(userId);
-            await KV.put(key, JSON.stringify([...userSet]));
->>>>>>> bfd009fd837946c85ee04b1bc6eb4d932eb4ec0c
         }
     } catch (e) {
         console.error('Failed to add verified user:', e);
@@ -283,7 +258,6 @@ async function addVerifiedUser(userId) {
 }
 
 async function removeVerifiedUser(userId) {
-<<<<<<< HEAD
     const key = 'verified_users_list_v2';
     try {
         // 确保用户ID是字符串
@@ -296,17 +270,6 @@ async function removeVerifiedUser(userId) {
         if (userMap.has(userIdStr)) {
             userMap.delete(userIdStr);
             await KV.put(key, JSON.stringify([...userMap]));
-=======
-    const key = 'verified_users_list';
-    try {
-        const users = await KV.get(key);
-        if (!users) return;
-        
-        const userSet = new Set(JSON.parse(users));
-        if (userSet.has(userId)) {
-            userSet.delete(userId);
-            await KV.put(key, JSON.stringify([...userSet]));
->>>>>>> bfd009fd837946c85ee04b1bc6eb4d932eb4ec0c
         }
     } catch (e) {
         console.error('Failed to remove verified user:', e);
@@ -314,7 +277,6 @@ async function removeVerifiedUser(userId) {
 }
 
 async function getAllVerifiedUsers() {
-<<<<<<< HEAD
     const key = 'verified_users_list_v2';
     try {
         const users = await KV.get(key);
@@ -328,12 +290,6 @@ async function getAllVerifiedUsers() {
             normalizedMap.set(String(k), v);
         }
         return [...normalizedMap];
-=======
-    const key = 'verified_users_list';
-    try {
-        const users = await KV.get(key);
-        return users ? JSON.parse(users) : [];
->>>>>>> bfd009fd837946c85ee04b1bc6eb4d932eb4ec0c
     } catch (e) {
         console.error('Failed to get verified users:', e);
         return [];
@@ -716,11 +672,7 @@ async function onMessage(message, origin) {
     const isVerified = await isUserVerified(chatId);
 
     if (isVerified) {
-<<<<<<< HEAD
       // 4. 检查防刷屏限制
-=======
-      // 3. 检查防刷屏限制
->>>>>>> bfd009fd837946c85ee04b1bc6eb4d932eb4ec0c
       const rateLimit = checkRateLimit(chatId);
       if (!rateLimit.allowed) {
         return sendMessage({
@@ -1877,7 +1829,6 @@ function handleVerifyPage(request) {
             // 显示加载状态
             document.getElementById('verify-section').classList.add('hidden');
             document.getElementById('loading-msg').classList.remove('hidden');
-<<<<<<< HEAD
 
             // 获取用户信息
             let userInfo = null;
@@ -1894,8 +1845,6 @@ function handleVerifyPage(request) {
             } catch (e) {
                 console.log('获取用户信息失败:', e);
             }
-=======
->>>>>>> bfd009fd837946c85ee04b1bc6eb4d932eb4ec0c
 
             fetch('/verify-callback', {
                 method: 'POST',
@@ -1968,7 +1917,6 @@ async function handleVerifyCallback(request) {
 
     if (result.success) {
       // 验证通过！写入 KV
-<<<<<<< HEAD
       const verifiedKey = 'verified-' + String(uid);
       await KV.put(verifiedKey, 'true', { expirationTtl: VERIFICATION_TTL });
       memSet(verifiedKey, 'true', 5 * 60 * 1000); // 更新缓存
@@ -1985,13 +1933,6 @@ async function handleVerifyCallback(request) {
 
       // 添加到已验证用户列表（带昵称）
       await addVerifiedUser(uid, displayName);
-=======
-      await KV.put('verified-' + uid, 'true', { expirationTtl: VERIFICATION_TTL });
-      memSet('verified-' + uid, 'true', 5 * 60 * 1000); // 更新缓存
-      
-      // 添加到已验证用户列表
-      await addVerifiedUser(uid);
->>>>>>> bfd009fd837946c85ee04b1bc6eb4d932eb4ec0c
 
       // 主动通知用户验证成功
       await sendMessage({
