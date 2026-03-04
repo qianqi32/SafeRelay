@@ -1,7 +1,7 @@
 /**
- * SafeRelay - Telegram 双向机器人
+ * SafeRelay - Telegram 私聊机器人
  * 项目地址: https://github.com/qianqi32/SafeRelay
- * 版本: 1.0.2
+ * 版本: 1.0.3
  * 当前版本可能仍不稳定，如遇到 BUG 请提交至 issues
 */
 
@@ -146,7 +146,7 @@ function memDelete(key) {
     memCache.delete(key);
 }
 
-// 检查用户是否已验证（优先使用内存缓存）
+// 检查用户是否已验证（优先使用内存缓存，带重试机制）
 async function isUserVerified(userId) {
     const verifiedKey = 'verified-' + userId;
 
@@ -156,12 +156,22 @@ async function isUserVerified(userId) {
         return memVerified === "true";
     }
 
-    // 2. 检查 KV
-    const kvVerified = await KV.get(verifiedKey);
-    if (kvVerified === 'true') {
-        // 更新内存缓存
-        memSet(verifiedKey, 'true', 5 * 60 * 1000);
-        return true;
+    // 2. 检查 KV（带重试机制，解决最终一致性延迟问题）
+    const maxRetries = 3;
+    const retryDelay = 1500; // 1.5秒
+
+    for (let i = 0; i < maxRetries; i++) {
+        const kvVerified = await KV.get(verifiedKey);
+        if (kvVerified === 'true') {
+            // 更新内存缓存
+            memSet(verifiedKey, 'true', 5 * 60 * 1000);
+            return true;
+        }
+
+        // 如果不是最后一次尝试，等待后重试
+        if (i < maxRetries - 1) {
+            await new Promise(r => setTimeout(r, retryDelay));
+        }
     }
 
     return false;
@@ -529,12 +539,19 @@ function forwardMessage(msg) {
 // 设置 Telegram 命令列表
 async function setBotCommands() {
   const adminCommands = [
-    { command: 'help', description: '显示帮助信息' },
-    { command: 'menu', description: '打开图形管理菜单' },
-    { command: 'bcancel', description: '取消进行中的广播' },
-    { command: 'listwhite', description: '列出所有白名单用户' },
-    { command: 'welcome', description: '设置欢迎消息' },
-    { command: 'autoreply', description: '设置自动回复消息' }
+    { command: 'help', description: '显示帮助' },
+    { command: 'menu', description: '管理菜单' },
+    { command: 'block', description: '拉黑用户' },
+    { command: 'unblock', description: '解除拉黑' },
+    { command: 'clear_ver', description: '清除验证' },
+    { command: 'broadcast', description: '广播消息' },
+    { command: 'bcancel', description: '取消广播' },
+    { command: 'addwhite', description: '添加白名单' },
+    { command: 'removewhite', description: '移除白名单' },
+    { command: 'checkwhite', description: '检查白名单' },
+    { command: 'listwhite', description: '白名单列表' },
+    { command: 'welcome', description: '欢迎消息' },
+    { command: 'autoreply', description: '自动回复' }
   ];
 
   try {
@@ -1931,13 +1948,13 @@ async function handleVerifyCallback(request) {
         }
       }
 
-      // 添加到已验证用户列表（带昵称）
+      // 添加到已验证用户列表
       await addVerifiedUser(uid, displayName);
 
       // 主动通知用户验证成功
       await sendMessage({
         chat_id: uid,
-        text: '✅ 验证通过！\n\n请等待 3-5 秒后再发送消息，以确保验证状态同步。'
+        text: '✅ 验证通过！\n\n如果重复验证请等待一分钟后再发送消息，以确保验证状态同步。'
       });
 
       // 通知管理员有新用户验证
@@ -1945,10 +1962,8 @@ async function handleVerifyCallback(request) {
         chat_id: ADMIN_UID,
         text: `✅ <b>新用户验证通过</b>
 
-UID: <code>${uid}</code>
-昵称: ${escapeHtml(displayName)}
-
-用户现在可以发送消息了。`,
+UID: <code>${uid}</code>(${escapeHtml(displayName)})
+`,
         parse_mode: 'HTML'
       });
 

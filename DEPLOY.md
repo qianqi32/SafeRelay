@@ -31,7 +31,7 @@
 
 1. 点击 `Add`（添加绑定）
 2. 选择 `KV Namespace`（KV 命名空间）
-3. `Variable name` **必须填写 `KV`**（代码中写死了这个名字）
+3. `Variable name` **必须填写 `KV`**（必须大写，代码中写死了这个名字）
 4. `KV Namespace`（KV 命名空间） 选择刚才创建的 `TG_BOT_KV`
 5. 点击 `Save and deploy`（保存并部署）
 

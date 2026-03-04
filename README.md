@@ -1,8 +1,8 @@
-# SafeRelay - 安全中转机器人
+# SafeRelay - 安全私聊机器人
 
 ## 🔥 项目简介
 
-SafeRelay 是一个轻量级的 Telegram 中转机器人，专注于防骚扰和高效沟通。它采用 **单对单** 模式，支持人机验证、联合封禁、自定义欢迎消息和自动回复等多个功能。
+SafeRelay 是一个轻量级的 Telegra 私聊机器人，专注于防骚扰和高效沟通。它采用 **单对单** 模式，支持人机验证、联合封禁、自定义欢迎消息和自动回复等多个功能。
 
 机器人采用 Serverless 架构，无需服务器即可部署，零成本运行！
 
@@ -106,7 +106,7 @@ SafeRelay/
 ├── worker.js          # 主程序代码
 ├── DEPLOY.md          # 部署指南
 ├── README.md          # 项目说明
-├── LICENSE            # MIT 许可证
+├── LICENSE            # GPL-3.0 许可证
 └── data/
     └── fraud.db       # 欺诈用户数据库
 ```
@@ -122,18 +122,42 @@ SafeRelay/
 
 ## 🙏 致谢
 
-本项目在开发过程中参考和借鉴了以下优秀项目：
+本项目是以下开源项目的衍生作品，感谢所有上游项目的作者：
 
-- [NFD](https://github.com/LloydAsp/nfd) - 基础架构和核心功能设计
-- [NFD3.0 (NodeSeek)](https://www.nodeseek.com/post-545453-1) - Cloudflare Turnstile人机验证实现
-- [RelayGo](https://github.com/abcxyz-123456/RelayGo) - 联合封禁系统和管理面板设计
-- [telegram-verify-bot](https://github.com/Squarelan/telegram-verify-bot) - 白名单设计
+### 核心基础
+- **[NFD 3.0](https://www.nodeseek.com/post-545453-1)** (NodeSeek Post #545453)
+  - 基于 [NFD](https://github.com/LloydAsp/nfd) by LloydAsp 开发
+  - 许可证: GPL-3.0
+  - 贡献: 核心架构、Cloudflare Turnstile 人机验证
+
+- **[NFD](https://github.com/LloydAsp/nfd)** by LloydAsp
+  - 许可证: GPL-3.0
+  - 贡献: 原始基础架构、消息中转核心逻辑
+
+### 功能参考
+- **[RelayGo](https://github.com/abcxyz-123456/RelayGo)**
+  - 许可证: GPL-3.0
+  - 贡献: 联合封禁系统、管理面板设计、广播功能、消息统计、防刷屏机制
+
+- **[telegram-verify-bot](https://github.com/Squarelan/telegram-verify-bot)**
+  - 许可证: GPL-3.0
+  - 贡献: 白名单功能设计、欺诈检测数据库设计
+
+### 说明
+SafeRelay 在 NFD 3.0 的基础上，整合并改进了 RelayGo 的多项功能，同时新增了欺诈检测数据库、内存缓存层等特性。所有上游项目均采用 GPL-3.0 许可证，本项目严格遵守该许可证条款。
 
 由衷的感谢以上项目的作者！
 
 ## 📜 许可证
 
-本项目采用 [MIT](https://mit-license.org) 开源协议。欢迎 Fork / PR / Issue。
+本项目基于 [NFD](https://github.com/LloydAsp/nfd) 开发，采用 [GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.html) (GPL-3.0) 开源协议。
+
+作为 GPL-3.0 许可软件的衍生作品，本项目遵循相同的许可证条款。您可以自由使用、修改和分发，但必须遵守 GPL-3.0 的要求，包括：
+- 保留版权声明
+- 使用相同的许可证（GPL-3.0）发布衍生作品
+- 提供源代码
+
+详见 [LICENSE](./LICENSE) 文件。
 
 ---
 

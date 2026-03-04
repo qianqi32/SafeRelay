@@ -1,7 +1,67 @@
-Copyright © 2026 <copyright holders>
+GNU GENERAL PUBLIC LICENSE
+Version 3, 29 June 2007
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+Copyright (C) 2026 SafeRelay Contributors
 
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+================================================================================
+                           ATTRIBUTION NOTICE
+================================================================================
+
+This project is a derivative work incorporating code and/or concepts from
+the following projects:
+
+1. NFD 3.0 (NodeSeek Post #545453)
+   - Base: NFD (https://github.com/LloydAsp/nfd) by LloydAsp
+   - License: GNU General Public License v3.0
+   - Usage: Core architecture, Turnstile verification implementation
+
+2. NFD (https://github.com/LloydAsp/nfd)
+   - Author: LloydAsp
+   - License: GNU General Public License v3.0
+   - Usage: Original base architecture and message relay logic
+
+3. RelayGo (https://github.com/abcxyz-123456/RelayGo)
+   - License: GNU General Public License v3.0
+   - Usage: Union ban system, admin panel design, broadcast functionality,
+            message statistics, rate limiting implementation
+
+4. telegram-verify-bot (https://github.com/Squarelan/telegram-verify-bot)
+   - License: GNU General Public License v3.0
+   - Usage: White list functionality, fraud detection database design
+
+All upstream projects are licensed under GPL-3.0. As a derivative work,
+this project complies with the GPL-3.0 license terms.
+
+================================================================================
+                         MODIFICATION SUMMARY
+================================================================================
+
+SafeRelay adds the following features on top of the upstream projects:
+- Cloudflare Turnstile human verification
+- Union ban system integration
+- Local fraud detection database
+- White list functionality
+- Graphical admin panel (Inline Keyboard)
+- Broadcast system with batch processing
+- Message statistics tracking
+- Rate limiting and spam protection
+- Message editing synchronization
+- Memory caching layer for performance
+
+================================================================================
+
+For the full GPL-3.0 license text, visit:
+https://www.gnu.org/licenses/gpl-3.0.html
