@@ -1761,7 +1761,7 @@ async function setBotCommands() {
     { command: 'ban', description: '封禁用户' },
     { command: 'unban', description: '解除封禁' },
     { command: 'unverify', description: '取消验证' },
-    { command: 'trust', description: '信任用户(白名单)' },
+    { command: 'trust', description: '信任用户' },
     { command: 'untrust', description: '取消信任' },
     { command: 'broadcast', description: '广播消息' },
     { command: 'bcancel', description: '取消广播' },
