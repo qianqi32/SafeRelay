@@ -1,13 +1,9 @@
 /**
  * SafeRelay - Telegram 私聊机器人
  * 项目地址: https://github.com/qianqi32/SafeRelay
- * 版本: 1.0.5
+ * 版本: 1.0.6
  * 当前版本可能仍不稳定，如遇到 BUG 请提交至 issues
 */
-
-// Cloudflare Turnstile 配置（可选，用于网页验证）
-const CF_TURNSTILE_SITE_KEY = '0x4AAAAAAAXXXXXXXXXXXXXXXXXXXX';  // 替换为你的 Site Key
-const CF_TURNSTILE_SECRET_KEY = '0x4AAAAAAAXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX';  // 替换为你的 Secret Key
 
 // 基础配置
 const getEnv = (key) => {
@@ -19,7 +15,17 @@ const getEnv = (key) => {
 const TOKEN = getEnv('ENV_BOT_TOKEN');
 const WEBHOOK = '/endpoint';
 const SECRET = getEnv('ENV_BOT_SECRET');
-const ADMIN_UID = getEnv('ENV_ADMIN_UID');
+const RAW_ADMIN_UID = getEnv('ENV_ADMIN_UID');
+const ADMIN_IDS_ENV = getEnv('ADMIN_IDS');
+const ADMIN_ID_LIST = parseAdminIdList(RAW_ADMIN_UID, ADMIN_IDS_ENV);
+const ADMIN_ALLOWLIST = new Set(ADMIN_ID_LIST);
+const ADMIN_UID = ADMIN_ID_LIST[0] || null;
+const GROUP_ID = (() => {
+  const value = getEnv('GROUP_ID');
+  if (typeof value === 'undefined' || value === null) return null;
+  const normalized = String(value).trim();
+  return normalized ? normalized : null;
+})();
 
 // 验证通过后的有效期 (秒)，默认 7 天
 const VERIFICATION_TTL = 60 * 60 * 24 * 7;
@@ -32,7 +38,7 @@ const CONFIG = {
 
   // KV 配额熔断保护
   KV_QUOTA_BREAKER_KEY: '__kv_quota_exceeded__',
-  KV_QUOTA_NOTICE_COOLDOWN: 300,      // 5分钟内只通知一次
+  KV_QUOTA_NOTICE_COOLDOWN: 300,      // 5 分钟内只通知一次
   KV_QUOTA_BREAKER_TTL: 60,           // 熔断器持续时间（秒）
 
   // 用户资料缓存
@@ -44,7 +50,96 @@ const CONFIG = {
 
   // 验证并发保护
   VERIFY_LOCK_TTL_SECONDS: 60,        // 验证锁过期时间
+
+  // 话题健康检查配置
+  THREAD_HEALTH_TTL_MS: 30 * 60 * 1000,  // 话题健康状态缓存 TTL（30 分钟）
+  THREAD_HEALTH_CHECK_TIMEOUT_MS: 5000,  // 话题探测超时（5 秒）
+
+  // Workers AI 配置
+  AI_SPAM_DETECTION_ENABLED: false,   // AI 垃圾检测开关（默认关闭）
+  AI_MODEL_ID: '@cf/meta/llama-2-7b-chat-int8',  // AI 模型
+  AI_CONFIDENCE_THRESHOLD: 0.7,       // AI 置信度阈值
+  AI_RATE_LIMIT_PER_HOUR: 100,        // AI 每小时调用次数限制
+
+  // 垃圾话题管理配置
+  SPAM_TOPIC_ENABLED: false,          // 垃圾话题功能开关
+  SPAM_TOPIC_ID: null,                // 垃圾话题 ID（可选，用于静默转发）
+
+  // 数据安全性配置
+  TURNSTILE_SESSION_TTL_MS: 10 * 60 * 1000, // Turnstile 会话有效期
 };
+const textEncoder = new TextEncoder();
+let verificationSignKeyPromise = null;
+
+function parseAdminIdList(primaryId, allowlistEnv) {
+  const ids = [];
+  const pushId = (value) => {
+    if (!value && value !== 0) return;
+    const normalized = String(value).trim();
+    if (!normalized) return;
+    if (!/^-?\d+$/.test(normalized)) return;
+    if (!ids.includes(normalized)) {
+      ids.push(normalized);
+    }
+  };
+
+  if (allowlistEnv) {
+    allowlistEnv.split(/[,;\s]+/).forEach(pushId);
+  }
+  pushId(primaryId);
+  return ids;
+}
+
+function getTurnstileSiteKey() {
+  return (getEnv('CF_TURNSTILE_SITE_KEY') || '').trim();
+}
+
+function getTurnstileSecretKey() {
+  return (getEnv('CF_TURNSTILE_SECRET_KEY') || '').trim();
+}
+
+function getTurnstileAllowedHostnames() {
+  const raw = (getEnv('TURNSTILE_ALLOWED_HOSTNAMES') || '').trim();
+  if (!raw) return [];
+  return raw.split(/[,;\s]+/).map(h => h.trim()).filter(Boolean);
+}
+
+function getTurnstileExpectedAction() {
+  return (getEnv('TURNSTILE_ACTION') || '').trim();
+}
+
+function getVerificationSigningSecret() {
+  return (getEnv('VERIFY_SIGNING_SECRET') || SECRET || TOKEN || '').toString();
+}
+
+async function getVerificationSignKey() {
+  if (!verificationSignKeyPromise) {
+    verificationSignKeyPromise = crypto.subtle.importKey(
+      'raw',
+      textEncoder.encode(getVerificationSigningSecret() || 'saferelay-signing-secret'),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+  }
+  return verificationSignKeyPromise;
+}
+
+async function signVerificationPayload(payload) {
+  const key = await getVerificationSignKey();
+  const signature = await crypto.subtle.sign('HMAC', key, textEncoder.encode(payload));
+  return bufferToBase64Url(signature);
+}
+
+function bufferToBase64Url(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
 
 // ========== 安全工具函数 ==========
 
@@ -99,6 +194,87 @@ async function safeGetJSON(key, defaultValue = null) {
   }
 }
 
+/**
+ * 恒定时间字符串比较（防止时序攻击）
+ * @param {string} a - 字符串 a
+ * @param {string} b - 字符串 b
+ * @returns {boolean} 是否相等
+ */
+function constantTimeCompare(a, b) {
+  if (a.length !== b.length) {
+    return false;
+  }
+
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+
+  return result === 0;
+}
+
+const TURNSTILE_SESSION_PREFIX = 'turnstile_session:';
+
+async function createTurnstileSession(userId) {
+  const sessionId = secureRandomId(32);
+  const expiresAt = Date.now() + CONFIG.TURNSTILE_SESSION_TTL_MS;
+  const payload = `${sessionId}.${userId}.${expiresAt}`;
+  const signature = await signVerificationPayload(payload);
+  await KV.put(
+    `${TURNSTILE_SESSION_PREFIX}${sessionId}`,
+    JSON.stringify({ userId, expiresAt }),
+    { expirationTtl: Math.ceil(CONFIG.TURNSTILE_SESSION_TTL_MS / 1000) }
+  );
+  return { sessionId, signature, expiresAt };
+}
+
+async function validateTurnstileSession(sessionId, signature) {
+  if (!sessionId || !signature) {
+    return { valid: false };
+  }
+
+  const stored = await KV.get(`${TURNSTILE_SESSION_PREFIX}${sessionId}`);
+  if (!stored) {
+    return { valid: false };
+  }
+
+  let data;
+  try {
+    data = JSON.parse(stored);
+  } catch (e) {
+    Logger.error('turnstile_session_parse_failed', e);
+    await KV.delete(`${TURNSTILE_SESSION_PREFIX}${sessionId}`);
+    return { valid: false };
+  }
+
+  if (!data || !data.userId || !data.expiresAt) {
+    await KV.delete(`${TURNSTILE_SESSION_PREFIX}${sessionId}`);
+    return { valid: false };
+  }
+
+  if (Date.now() > data.expiresAt) {
+    await KV.delete(`${TURNSTILE_SESSION_PREFIX}${sessionId}`);
+    return { valid: false };
+  }
+
+  const expectedPayload = `${sessionId}.${data.userId}.${data.expiresAt}`;
+  const expectedSig = await signVerificationPayload(expectedPayload);
+  if (!constantTimeCompare(expectedSig, signature)) {
+    return { valid: false };
+  }
+
+  return { valid: true, userId: data.userId };
+}
+
+async function consumeTurnstileSession(sessionId) {
+  if (!sessionId) return;
+  try {
+    await KV.delete(`${TURNSTILE_SESSION_PREFIX}${sessionId}`);
+  } catch (e) {
+    Logger.warn('turnstile_session_delete_failed', { sessionId, error: e.message });
+  }
+}
+
 // ========== 本地题库验证配置 ==========
 // 验证模式: 'local_quiz'(默认本地题库) / 'turnstile'(Turnstile网页验证) / 'both'(两者都需要)
 const VERIFY_MODE_DEFAULT = 'local_quiz';
@@ -135,6 +311,9 @@ const KV_KEYS = {
   VERIFY_MODE: 'config:verify_mode',  // 验证模式配置
   SPAM_FILTER_ENABLED: 'config:spam_filter_enabled',  // 垃圾过滤开关
   SPAM_FILTER_RULES: 'config:spam_filter_rules',      // 垃圾过滤规则
+  AI_SPAM_DETECTION: 'config:ai_spam_detection',      // AI 垃圾检测配置
+  AI_USAGE_COUNT: 'stats:ai_usage:',                  // AI 使用统计（按小时）
+  SPAM_TOPIC_CONFIG: 'config:spam_topic',              // 垃圾话题配置
 };
 
 // ========== 垃圾消息过滤配置 ==========
@@ -224,22 +403,54 @@ const Logger = {
 const RATE_LIMIT_CONFIG = {
   // 普通消息频率限制
   message: {
-    windowMs: 5000,      // 5秒窗口
-    maxRequests: 5,      // 最多5条消息
+    windowMs: 5000,      // 5 秒窗口
+    maxRequests: 5,      // 最多 5 条消息
     keyPrefix: 'ratelimit:msg'
   },
   // 验证请求频率限制
   verify: {
-    windowMs: 300000,    // 5分钟窗口
-    maxRequests: 3,      // 最多3次验证请求
+    windowMs: 300000,    // 5 分钟窗口
+    maxRequests: 3,      // 最多 3 次验证请求
     keyPrefix: 'ratelimit:verify'
   },
   // 验证答案尝试限制
   verifyAttempt: {
-    windowMs: 60000,     // 1分钟窗口
-    maxRequests: 5,      // 最多5次尝试
+    windowMs: 60000,     // 1 分钟窗口
+    maxRequests: 5,      // 最多 5 次尝试
     keyPrefix: 'ratelimit:attempt'
+  },
+  // 广播消息频率限制
+  broadcast: {
+    windowMs: 86400000,  // 24 小时窗口
+    maxRequests: 1,      // 每天 1 次广播
+    keyPrefix: 'ratelimit:broadcast'
+  },
+  // AI 检测频率限制
+  aiDetect: {
+    windowMs: 3600000,   // 1 小时窗口
+    maxRequests: 100,    // 每小时 100 次 AI 检测
+    keyPrefix: 'ratelimit:ai'
+  },
+  // 管理命令频率限制
+  adminCommand: {
+    windowMs: 60000,     // 1 分钟窗口
+    maxRequests: 30,     // 每分钟 30 次命令
+    keyPrefix: 'ratelimit:admin'
   }
+};
+
+// 限流增强配置
+const RATE_LIMIT_ENHANCED = {
+  // 是否启用分级限流（根据用户行为动态调整）
+  enabledDynamicLimit: true,
+  // 可信用户倍率（信任用户更宽松）
+  trustedUserMultiplier: 2,
+  // 新用户倍率（新用户更严格）
+  newUserMultiplier: 0.5,
+  // 最大累积惩罚次数
+  maxPenaltyCount: 10,
+  // 惩罚冷却时间（毫秒）
+  penaltyCooldownMs: 300000  // 5 分钟
 };
 
 // 联合封禁配置
@@ -334,13 +545,182 @@ async function checkFraud(userId) {
   }
 }
 
+// ========== 话题健康检查机制 ==========
+
+// 话题健康状态缓存（内存缓存）
+const threadHealthCache = new Map();
+
+/**
+ * 验证话题是否有效（带缓存）
+ * @param {number} groupId - 群组 ID
+ * @param {number} threadId - 话题 ID
+ * @returns {Promise<boolean>} 话题是否有效
+ */
+async function validateForumThread(groupId, threadId) {
+  if (!groupId || !threadId) return false;
+
+  const cacheKey = `thread:${threadId}`;
+  const now = Date.now();
+  const cached = threadHealthCache.get(cacheKey);
+
+  // 检查缓存
+  if (cached && (now - cached.ts < CONFIG.THREAD_HEALTH_TTL_MS)) {
+    return cached.ok;
+  }
+
+  // 缓存过期或不存在，进行健康探测
+  const probeResult = await probeForumThread(groupId, threadId);
+
+  // 更新缓存
+  threadHealthCache.set(cacheKey, {
+    ok: probeResult,
+    ts: now
+  });
+
+  // 清理过期的缓存条目
+  if (threadHealthCache.size > 1000) {
+    for (const [key, value] of threadHealthCache.entries()) {
+      if (now - value.ts > CONFIG.THREAD_HEALTH_TTL_MS) {
+        threadHealthCache.delete(key);
+      }
+    }
+  }
+
+  return probeResult;
+}
+
+/**
+ * 探测话题是否存在且可用
+ * @param {number} groupId - 群组 ID
+ * @param {number} threadId - 话题 ID
+ * @returns {Promise<boolean>} 话题是否可用
+ */
+async function probeForumThread(groupId, threadId) {
+  if (!groupId || !threadId) return false;
+  try {
+    const result = await requestTelegram('getForumTopic', {
+      chat_id: groupId,
+      message_thread_id: threadId
+    });
+
+    if (result.ok) {
+      const topicInfo = result.result || {};
+      if (topicInfo.closed || topicInfo.is_closed) {
+        Logger.warn('thread_is_closed', { threadId, groupId });
+        return false;
+      }
+      return true;
+    }
+
+    const desc = (result.description || '').toLowerCase();
+    if (desc.includes('message thread not found') || desc.includes('topic not found')) {
+      Logger.warn('thread_probe_missing', { threadId, groupId, error: result.description });
+      return false;
+    }
+    if (desc.includes('not enough rights')) {
+      Logger.warn('thread_probe_permission_denied', { threadId, groupId, error: result.description });
+      await verifyTopicEnvironment({ force: true });
+      return false;
+    }
+    if (desc.includes('method not found')) {
+      return pingForumThread(groupId, threadId);
+    }
+
+    Logger.warn('thread_probe_unknown_error', { threadId, groupId, error: result.description });
+    return true;
+  } catch (e) {
+    Logger.error('thread_probe_error', e, { threadId, groupId });
+    return true;
+  }
+}
+
+async function pingForumThread(groupId, threadId) {
+  try {
+    const probe = await requestTelegram('sendMessage', {
+      chat_id: groupId,
+      message_thread_id: threadId,
+      text: '.',
+      disable_notification: true
+    });
+
+    if (probe.ok && probe.result?.message_id) {
+      await requestTelegram('deleteMessage', {
+        chat_id: groupId,
+        message_id: probe.result.message_id
+      }).catch(err => Logger.warn('thread_probe_cleanup_failed', err, { groupId, threadId }));
+      return true;
+    }
+
+    const desc = (probe.description || '').toLowerCase();
+    if (desc.includes('message thread not found') || desc.includes('topic not found')) {
+      Logger.warn('thread_probe_ping_missing', { threadId, groupId, error: probe.description });
+      return false;
+    }
+    return true;
+  } catch (e) {
+    Logger.error('thread_probe_ping_error', e, { threadId, groupId });
+    return true;
+  }
+}
+
+/**
+ * 重置用户验证状态并触发重新验证
+ * @param {object} options - 选项
+ * @param {string} options.userId - 用户 ID
+ * @param {string} options.oldThreadId - 旧话题 ID
+ * @param {number} options.pendingMsgId - 待处理消息 ID
+ * @param {string} options.reason - 原因
+ */
+async function resetUserVerificationAndRequireReverify({
+  userId,
+  oldThreadId,
+  pendingMsgId,
+  reason = 'topic_invalid'
+}) {
+  try {
+    Logger.info('resetting_user_verification', {
+      userId,
+      oldThreadId,
+      reason
+    });
+
+    // 删除旧的 thread 映射
+    if (oldThreadId) {
+      await safeKvDelete(`thread:${oldThreadId}`);
+    }
+
+    // 删除用户验证状态
+    await safeKvDelete(`verified-${userId}`);
+    await safeKvDelete(`user:${userId}`);
+
+    // 清理内存缓存
+    memDelete(`verified-${userId}`);
+    memDelete(`user:${userId}`);
+    if (oldThreadId) {
+      threadHealthCache.delete(`thread:${oldThreadId}`);
+    }
+
+    // 通知用户需要重新验证
+    await sendMessage({
+      chat_id: userId,
+      text: '⚠️ <b>验证失效通知</b>\n\n您的话题可能已被删除或失效，需要重新验证。\n\n请点击 /start 重新开始验证流程。',
+      parse_mode: 'HTML'
+    });
+
+    Logger.info('user_verification_reset_complete', { userId, reason });
+
+  } catch (e) {
+    Logger.error('reset_verification_failed', e, { userId, reason });
+  }
+}
+
 // ========== 本地题库验证函数 ==========
 
 // 检查 Turnstile 是否已配置
 function hasTurnstileConfigured() {
-  const site = (CF_TURNSTILE_SITE_KEY || '').trim();
-  const secret = (CF_TURNSTILE_SECRET_KEY || '').trim();
-  return !!(site && secret && !site.includes('XXXX') && !secret.includes('XXXX'));
+  const site = getTurnstileSiteKey();
+  const secret = getTurnstileSecretKey();
+  return !!(site && secret);
 }
 
 // 获取当前验证模式
@@ -458,6 +838,79 @@ async function deleteQuizChallenge(userId) {
   await KV.delete(`quiz_challenge:${userId}`);
 }
 
+// ========== 并发验证锁机制 ==========
+
+/**
+ * 尝试获取验证锁
+ * @param {string} userId - 用户 ID
+ * @returns {Promise<{acquired: boolean, lockInfo: object|null}>} 是否成功获取锁
+ */
+async function tryAcquireVerifyLock(userId) {
+  const lockKey = `verify_lock:${userId}`;
+  const now = Date.now();
+
+  try {
+    // 尝试获取锁
+    const lockData = await KV.get(lockKey);
+
+    if (!lockData) {
+      // 锁不存在，可以获取
+      const newLock = {
+        acquiredAt: now,
+        expiresAt: now + (CONFIG.VERIFY_LOCK_TTL_SECONDS * 1000)
+      };
+
+      await KV.put(lockKey, JSON.stringify(newLock), {
+        expirationTtl: CONFIG.VERIFY_LOCK_TTL_SECONDS + 10 // 多给 10 秒缓冲
+      });
+
+      Logger.debug('verify_lock_acquired', { userId });
+      return { acquired: true, lockInfo: newLock };
+    }
+
+    // 锁已存在，检查是否过期
+    const lockInfo = JSON.parse(lockData);
+    if (lockInfo.expiresAt < now) {
+      // 锁已过期，可以重新获取
+      const newLock = {
+        acquiredAt: now,
+        expiresAt: now + (CONFIG.VERIFY_LOCK_TTL_SECONDS * 1000)
+      };
+
+      await KV.put(lockKey, JSON.stringify(newLock), {
+        expirationTtl: CONFIG.VERIFY_LOCK_TTL_SECONDS + 10
+      });
+
+      Logger.debug('verify_lock_reacquired', { userId, expiredAt: lockInfo.expiresAt });
+      return { acquired: true, lockInfo: newLock };
+    }
+
+    // 锁未过期，拒绝获取
+    const remainingMs = lockInfo.expiresAt - now;
+    Logger.debug('verify_lock_busy', { userId, remainingMs });
+    return { acquired: false, lockInfo: { ...lockInfo, remainingMs } };
+
+  } catch (e) {
+    Logger.error('verify_lock_error', e, { userId });
+    // 出错时允许继续，避免锁死
+    return { acquired: true, lockInfo: null };
+  }
+}
+
+/**
+ * 释放验证锁
+ * @param {string} userId - 用户 ID
+ */
+async function releaseVerifyLock(userId) {
+  const lockKey = `verify_lock:${userId}`;
+  try {
+    await KV.delete(lockKey);
+    Logger.debug('verify_lock_released', { userId });
+  } catch (e) {
+    Logger.error('verify_lock_release_error', e, { userId });
+  }
+}
+
 // 验证答案
 async function verifyQuizAnswer(userId, answerIndex) {
   const challenge = await getQuizChallenge(userId);
@@ -552,7 +1005,7 @@ function countLinks(text) {
 }
 
 // 检查是否为垃圾消息
-async function checkSpam(message) {
+async function checkSpam(message, userId = null) {
   // 获取开关状态
   const enabled = await getSpamFilterEnabled();
   if (!enabled) return { isSpam: false, reason: null };
@@ -609,7 +1062,498 @@ async function checkSpam(message) {
     } catch (e) { /* 忽略无效正则 */ }
   }
 
+  // 6. AI 检测（可选，需要配置 Workers AI）
+  const aiResult = await checkSpamWithAI(text, userId);
+  if (aiResult.isSpam) {
+    return aiResult;
+  }
+
   return { isSpam: false, reason: null };
+}
+
+// ========== 垃圾话题管理 ==========
+
+// 获取垃圾话题配置
+async function getSpamTopicConfig() {
+  return await safeGetJSON(KV_KEYS.SPAM_TOPIC_CONFIG, {
+    enabled: CONFIG.SPAM_TOPIC_ENABLED,
+    topicId: CONFIG.SPAM_TOPIC_ID,
+    autoCreate: false,
+    notifyAdmin: true
+  });
+}
+
+// 设置垃圾话题配置
+async function setSpamTopicConfig(config) {
+  await KV.put(KV_KEYS.SPAM_TOPIC_CONFIG, JSON.stringify(config));
+}
+
+// 检查垃圾话题功能是否启用
+async function isSpamTopicEnabled() {
+  const config = await getSpamTopicConfig();
+  return config.enabled === true;
+}
+
+// 创建垃圾话题
+async function createSpamTopic(groupId) {
+  try {
+    // 先尝试获取已有的垃圾话题（通过列出所有话题）
+    const listResponse = await requestTelegram('getForumTopicInfo', {
+      chat_id: groupId,
+      message_thread_id: 1 // 先尝试 General 话题
+    });
+
+    // 尝试创建一个新话题
+    const response = await requestTelegram('createForumTopic', {
+      chat_id: groupId,
+      name: '🗑 垃圾消息回收站',
+      icon_color: 0x8E8E8E  // 灰色图标
+    });
+
+    if (response && response.ok) {
+      const topicId = response.result.message_thread_id;
+      Logger.info('spam_topic_created', { groupId, topicId });
+      return topicId;
+    }
+
+    // 如果创建失败，检查是否是因为话题已存在
+    if (response && response.description && response.description.includes('TOPIC_TITLE_IS_EMPTY')) {
+      Logger.warn('spam_topic_create_invalid', { groupId, description: response.description });
+    }
+
+    if (response && response.description && (response.description.includes('TOPIC_CLOSED') || response.description.includes('TOPIC_NOT_FOUND'))) {
+      Logger.error('spam_topic_create_failed', { groupId, description: response.description });
+    }
+
+    return null;
+  } catch (e) {
+    Logger.error('create_spam_topic_failed', e, { groupId });
+    return null;
+  }
+}
+
+// 转发消息到垃圾话题
+async function forwardToSpamTopic(message, groupId, topicId) {
+  try {
+    await forwardMessage({
+      chat_id: groupId,
+      message_thread_id: topicId,
+      from_chat_id: message.chat.id,
+      message_id: message.message_id
+    });
+    return true;
+  } catch (e) {
+    Logger.error('forward_to_spam_topic_failed', e, { topicId });
+    return false;
+  }
+}
+
+// 静默转发垃圾消息（用户无感知）
+async function silentlyForwardSpamMessage(message, groupId, topicId) {
+  try {
+    // 转发到垃圾话题
+    await forwardToSpamTopic(message, groupId, topicId);
+
+    // 通知管理员
+    await sendMessage({
+      chat_id: ADMIN_UID,
+      text: `🗑 <b>垃圾消息已静默处理</b>\n\nUID: <code>${message.from?.id}</code>\n话题 ID: <code>${topicId}</code>\n\n<i>消息已转发到垃圾话题，用户无感知</i>`,
+      parse_mode: 'HTML'
+    });
+
+    return true;
+  } catch (e) {
+    Logger.error('silently_forward_spam_failed', e);
+    return false;
+  }
+}
+
+// 从垃圾话题恢复消息
+async function restoreMessageFromSpamTopic(groupId, spamTopicId, targetTopicId, messageId) {
+  try {
+    // 转发回正常话题
+    await forwardMessage({
+      chat_id: groupId,
+      message_thread_id: targetTopicId,
+      from_chat_id: groupId,
+      message_id: messageId
+    });
+
+    Logger.info('message_restored_from_spam', { groupId, spamTopicId, targetTopicId, messageId });
+    return true;
+  } catch (e) {
+    Logger.error('restore_message_failed', e);
+    return false;
+  }
+}
+
+// ========== 用户话题管理 ==========
+async function ensureUserTopic(userId, profile = null) {
+  if (!GROUP_ID) {
+    Logger.warn('ensure_user_topic_no_group_id', { userId });
+    return null;
+  }
+
+  // 尝试验证环境，但即使验证失败也尝试继续
+  const topicEnv = await verifyTopicEnvironment({ notifyOnFailure: false });
+  Logger.info('ensure_user_topic_env_check', { userId, topicEnv });
+
+  const userKey = `user:${userId}`;
+  let userData = await safeGetJSON(userKey, null);
+
+  if (userData && userData.thread_id) {
+    const healthy = await validateForumThread(GROUP_ID, userData.thread_id);
+    Logger.info('ensure_user_topic_thread_health', { userId, threadId: userData.thread_id, healthy });
+    if (healthy) {
+      return { threadId: userData.thread_id, userData, newlyCreated: false };
+    }
+
+    try {
+      await safeKvDelete(`thread:${userData.thread_id}`);
+    } catch (e) {
+      Logger.warn('cleanup_stale_thread_failed', e, { threadId: userData.thread_id });
+    }
+  }
+
+  const lockToken = await acquireTopicLock(userId);
+  if (!lockToken) {
+    Logger.warn('topic_lock_acquire_failed', { userId });
+  }
+
+  try {
+    userData = await safeGetJSON(userKey, null);
+    if (userData && userData.thread_id) {
+      const healthy = await validateForumThread(GROUP_ID, userData.thread_id);
+      if (healthy) {
+        return { threadId: userData.thread_id, userData, newlyCreated: false };
+      }
+      try {
+        await safeKvDelete(`thread:${userData.thread_id}`);
+      } catch (e) {
+        Logger.warn('cleanup_stale_thread_failed', e, { threadId: userData.thread_id });
+      }
+    }
+
+    if (!profile) {
+      profile = await getUserProfile(userId);
+    }
+
+    Logger.info('ensure_user_topic_creating_thread', { userId });
+    const threadId = await createUserTopicThread(userId, profile);
+    Logger.info('ensure_user_topic_thread_created', { userId, threadId });
+    if (!threadId) {
+      return null;
+    }
+
+    const record = {
+      user_id: userId,
+      thread_id: threadId,
+      username: profile?.username || null,
+      first_name: profile?.first_name || '',
+      last_name: profile?.last_name || '',
+      updated_at: Date.now()
+    };
+
+    await safeKvPut(userKey, JSON.stringify(record));
+    await safeKvPut(`thread:${threadId}`, userId);
+    threadHealthCache.set(`thread:${threadId}`, { ok: true, ts: Date.now() });
+
+    return { threadId, userData: record, newlyCreated: true };
+  } finally {
+    await releaseTopicLock(userId, lockToken);
+  }
+}
+
+async function invalidateUserTopicMapping(userId, threadId = null) {
+  try {
+    if (threadId) {
+      await safeKvDelete(`thread:${threadId}`);
+      threadHealthCache.delete(`thread:${threadId}`);
+      try {
+        await KV.delete(`thread_ok:${threadId}`);
+      } catch (e) {
+        Logger.warn('thread_ok_delete_failed', e, { threadId });
+      }
+    }
+    await safeKvDelete(`user:${userId}`);
+    memDelete(`user:${userId}`);
+  } catch (e) {
+    Logger.warn('invalidate_user_topic_failed', e, { userId, threadId });
+  }
+
+  if (ADMIN_UID) {
+    const noticeKey = `topic_recover:${userId}`;
+    const lastNotice = memGet(noticeKey);
+    if (!lastNotice) {
+      await sendMessage({
+        chat_id: ADMIN_UID,
+        text: `⚠️ 访客 ${userId} 的话题已失效，正在尝试重新创建。`
+      }).catch(() => { });
+      memSet(noticeKey, Date.now(), 5 * 60 * 1000);
+    }
+  }
+}
+
+async function createUserTopicThread(userId, profile = null) {
+  if (!GROUP_ID) {
+    Logger.error('create_user_topic_no_group_id', { userId });
+    return null;
+  }
+
+  const groupIdStr = String(GROUP_ID);
+  Logger.info('create_user_topic_group_id_check', { userId, GROUP_ID, startsWithMinus100: groupIdStr.startsWith('-100') });
+
+  if (!groupIdStr.startsWith('-100')) {
+    Logger.error('create_user_topic_invalid_group_id', {
+      userId,
+      GROUP_ID,
+      hint: '群组ID必须以-100开头，请使用超级群组！'
+    });
+  }
+
+  const topicTitle = buildUserTopicTitle(userId, profile);
+  Logger.info('create_user_topic_starting', { userId, topicTitle });
+
+  try {
+    const response = await requestTelegram('createForumTopic', {
+      chat_id: GROUP_ID,
+      name: topicTitle
+    });
+
+    Logger.info('create_user_topic_response', { userId, ok: response?.ok, description: response?.description });
+
+    if (!response || !response.ok) {
+      Logger.error('create_user_topic_failed', {
+        userId,
+        description: response?.description
+      });
+      return null;
+    }
+
+    const threadId = response.result.message_thread_id;
+    Logger.info('create_user_topic_got_thread_id', { userId, threadId });
+
+    try {
+      await sendTopicWelcomeMessage(threadId, userId, profile);
+    } catch (welcomeErr) {
+      Logger.warn('send_topic_welcome_failed', welcomeErr, { userId, threadId });
+    }
+
+    Logger.info('user_topic_created', { userId, threadId, topicTitle });
+    return threadId;
+  } catch (e) {
+    Logger.error('create_user_topic_error', e, { userId });
+    return null;
+  }
+}
+
+async function acquireTopicLock(userId) {
+  const lockKey = `topic_lock:${userId}`;
+  const token = secureRandomId(16);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    await KV.put(lockKey, token, { expirationTtl: 60 });
+    const stored = await KV.get(lockKey);
+    if (stored === token) {
+      return token;
+    }
+    await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)));
+  }
+  return null;
+}
+
+async function releaseTopicLock(userId, token) {
+  if (!token) return;
+  const lockKey = `topic_lock:${userId}`;
+  try {
+    const stored = await KV.get(lockKey);
+    if (stored === token) {
+      await KV.delete(lockKey);
+    }
+  } catch (e) {
+    Logger.warn('release_topic_lock_failed', e, { userId });
+  }
+}
+
+function buildUserTopicTitle(userId, profile = null) {
+  const parts = [];
+  if (profile) {
+    if (profile.first_name || profile.last_name) {
+      parts.push(`${profile.first_name || ''} ${profile.last_name || ''}`.trim());
+    }
+    if (profile.username) {
+      parts.push(`@${profile.username}`);
+    }
+  }
+
+  let base = parts.filter(Boolean).join(' ');
+  if (!base) base = `访客 ${userId}`;
+
+  let title = `#${userId} ${base}`.trim();
+  if (title.length > 60) {
+    title = title.slice(0, 60);
+  }
+  return title;
+}
+
+async function sendTopicWelcomeMessage(threadId, userId, profile = null) {
+  if (!GROUP_ID) return;
+  try {
+    const lines = [
+      '👤 <b>新访客对话</b>',
+      `UID：<code>${userId}</code>`
+    ];
+    if (profile?.username) {
+      lines.push(`用户名：@${escapeHtml(profile.username)}`);
+    }
+    if (profile?.first_name || profile?.last_name) {
+      lines.push(`姓名：${escapeHtml(`${profile.first_name || ''} ${profile.last_name || ''}`.trim())}`);
+    }
+    lines.push('\n请在此话题内回复用户消息。');
+
+    await sendMessage({
+      chat_id: GROUP_ID,
+      message_thread_id: threadId,
+      text: lines.join('\n'),
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true }
+    });
+  } catch (e) {
+    Logger.warn('topic_welcome_message_failed', e, { userId, threadId });
+  }
+}
+
+// ========== Workers AI 垃圾检测 ==========
+
+// 检查 AI 检测是否启用
+async function isAISpamDetectionEnabled() {
+  const config = await safeGetJSON(KV_KEYS.AI_SPAM_DETECTION, {
+    enabled: CONFIG.AI_SPAM_DETECTION_ENABLED,
+    confidenceThreshold: CONFIG.AI_CONFIDENCE_THRESHOLD
+  });
+  return config.enabled === true;
+}
+
+// 设置 AI 检测配置
+async function setAISpamDetectionConfig(config) {
+  await KV.put(KV_KEYS.AI_SPAM_DETECTION, JSON.stringify(config));
+}
+
+// 获取 AI 检测配置
+async function getAISpamDetectionConfig() {
+  return await safeGetJSON(KV_KEYS.AI_SPAM_DETECTION, {
+    enabled: CONFIG.AI_SPAM_DETECTION_ENABLED,
+    confidenceThreshold: CONFIG.AI_CONFIDENCE_THRESHOLD
+  });
+}
+
+// 检查 AI 使用速率限制
+async function checkAIRateLimit() {
+  const now = Date.now();
+  const hourKey = `${KV_KEYS.AI_USAGE_COUNT}${Math.floor(now / 3600000)}`;
+
+  const count = await KV.get(hourKey);
+  const currentCount = count ? parseInt(count) : 0;
+
+  if (currentCount >= CONFIG.AI_RATE_LIMIT_PER_HOUR) {
+    return { allowed: false, remaining: 0, resetAfter: 3600 - Math.floor((now % 3600000) / 1000) };
+  }
+
+  return { allowed: true, remaining: CONFIG.AI_RATE_LIMIT_PER_HOUR - currentCount };
+}
+
+// 增加 AI 使用计数
+async function incrementAIUsage() {
+  const now = Date.now();
+  const hourKey = `${KV_KEYS.AI_USAGE_COUNT}${Math.floor(now / 3600000)}`;
+  const currentCount = await KV.get(hourKey);
+  const newCount = (currentCount ? parseInt(currentCount) : 0) + 1;
+
+  await KV.put(hourKey, String(newCount), { expirationTtl: 7200 });
+}
+
+// 使用 Workers AI 检测垃圾消息
+async function checkSpamWithAI(text, userId = null) {
+  // 检查 AI 是否启用
+  const aiEnabled = await isAISpamDetectionEnabled();
+  if (!aiEnabled) {
+    return { isSpam: false, reason: null, aiSkipped: true };
+  }
+
+  // 检查速率限制
+  const rateLimit = await checkAIRateLimit();
+  if (!rateLimit.allowed) {
+    Logger.warn('ai_rate_limit_exceeded', { userId, remainingReset: rateLimit.resetAfter });
+    return { isSpam: false, reason: null, aiSkipped: true, rateLimited: true };
+  }
+
+  // 检查文本长度（太短不需要 AI 检测）
+  if (text.length < 20) {
+    return { isSpam: false, reason: null, aiSkipped: true, tooShort: true };
+  }
+
+  try {
+    // 构建 AI 提示词
+    const prompt = `请判断以下消息是否为垃圾广告消息。只回答"spam"或"not_spam"。
+    
+消息内容：
+${text}
+
+判断标准：
+- 包含推广、营销、投资、理财、博彩等内容 → spam
+- 包含多个链接或联系方式 → spam
+- 正常交流、提问、聊天 → not_spam
+
+你的回答（只回答 spam 或 not_spam）：`;
+
+    // 调用 Workers AI
+    const response = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${getEnv('CF_ACCOUNT_ID')}/ai/run/${CONFIG.AI_MODEL_ID}`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${getEnv('CF_AI_TOKEN')}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          messages: [
+            { role: 'user', content: prompt }
+          ],
+          max_tokens: 10,
+          temperature: 0.1
+        })
+      }
+    );
+
+    if (!response.ok) {
+      Logger.error('ai_api_call_failed', { status: response.status });
+      return { isSpam: false, reason: null, aiSkipped: true, apiError: true };
+    }
+
+    const result = await response.json();
+    const aiResponse = result.result?.response?.trim().toLowerCase() || '';
+
+    // 增加使用计数
+    await incrementAIUsage();
+
+    // 判断结果
+    const isSpam = aiResponse.includes('spam') && !aiResponse.includes('not_spam');
+
+    if (isSpam) {
+      Logger.info('ai_detected_spam', { userId, text: text.substring(0, 50) });
+      return {
+        isSpam: true,
+        reason: 'AI 识别为垃圾消息',
+        aiConfidence: 0.8,
+        aiResponse
+      };
+    }
+
+    return { isSpam: false, reason: null, aiChecked: true };
+
+  } catch (e) {
+    Logger.error('ai_detection_failed', e, { userId });
+    return { isSpam: false, reason: null, aiSkipped: true, error: true };
+  }
 }
 
 // 格式化规则为可读文本
@@ -729,22 +1673,58 @@ function parseSpamRulesEdit(text) {
   return rules;
 }
 
-// 内存缓存层
-const memCache = new Map();
-const MEMORY_CACHE_TTL = 30 * 60 * 1000;
+// ========== 多级缓存系统优化 ==========
 
+// L1 缓存：内存缓存（最快，进程内）
+const memCache = new Map();
+const MEMORY_CACHE_TTL = 30 * 60 * 1000; // 30 分钟
+const BOT_SELF_CACHE_KEY = 'bot:self_profile';
+const BOT_SELF_CACHE_TTL_MS = 10 * 60 * 1000;
+const TOPIC_ENV_CACHE_KEY = 'topic_env_status';
+const TOPIC_ENV_CACHE_TTL_MS = 5 * 60 * 1000;
+const TOPIC_ENV_ALERT_CACHE_KEY = 'topic_env_alert';
+const TOPIC_ENV_ALERT_COOLDOWN_MS = 10 * 60 * 1000;
+
+// L2 缓存：KV 缓存（较慢，持久化）
+const KV_CACHE_TTL = 60 * 60; // 1 小时
+
+// 缓存统计
+const cacheStats = {
+  hits: 0,
+  misses: 0,
+  kvHits: 0,
+  kvMisses: 0
+};
+
+/**
+ * L1 缓存获取
+ * @param {string} key - 缓存键
+ * @returns {any} 缓存值
+ */
 function memGet(key) {
   const item = memCache.get(key);
-  if (!item) return undefined;
-  if (Date.now() > item.expiry) {
-    memCache.delete(key);
+  if (!item) {
+    cacheStats.misses++;
     return undefined;
   }
+  if (Date.now() > item.expiry) {
+    memCache.delete(key);
+    cacheStats.misses++;
+    return undefined;
+  }
+  cacheStats.hits++;
   return item.value;
 }
 
+/**
+ * L1 缓存设置
+ * @param {string} key - 缓存键
+ * @param {any} value - 缓存值
+ * @param {number} ttlMs - 过期时间（毫秒）
+ */
 function memSet(key, value, ttlMs = MEMORY_CACHE_TTL) {
   memCache.set(key, { value, expiry: Date.now() + ttlMs });
+
   // 当缓存过大时，清理最旧的 20% 条目
   if (memCache.size > 2000) {
     const entriesToDelete = Math.floor(memCache.size * 0.2);
@@ -757,8 +1737,116 @@ function memSet(key, value, ttlMs = MEMORY_CACHE_TTL) {
   }
 }
 
+/**
+ * L1 缓存删除
+ * @param {string} key - 缓存键
+ */
 function memDelete(key) {
   memCache.delete(key);
+}
+
+/**
+ * L2 缓存获取（KV 持久化）
+ * @param {string} key - 缓存键
+ * @param {any} defaultValue - 默认值
+ * @returns {Promise<any>} 缓存值
+ */
+async function kvCacheGet(key, defaultValue = null) {
+  try {
+    const cached = await KV.get(key);
+    if (cached) {
+      cacheStats.kvHits++;
+      return JSON.parse(cached);
+    }
+    cacheStats.kvMisses++;
+    return defaultValue;
+  } catch (e) {
+    Logger.debug('kv_cache_get_error', e, { key });
+    return defaultValue;
+  }
+}
+
+/**
+ * L2 缓存设置（KV 持久化）
+ * @param {string} key - 缓存键
+ * @param {any} value - 缓存值
+ * @param {number} ttlSeconds - 过期时间（秒）
+ */
+async function kvCacheSet(key, value, ttlSeconds = KV_CACHE_TTL) {
+  try {
+    await KV.put(key, JSON.stringify(value), { expirationTtl: ttlSeconds });
+  } catch (e) {
+    Logger.debug('kv_cache_set_error', e, { key });
+  }
+}
+
+/**
+ * 多级缓存获取（L1 → L2）
+ * @param {string} key - 缓存键
+ * @param {Function} fetchFn - 获取数据的异步函数
+ * @param {number} l1Ttl - L1 缓存 TTL（毫秒）
+ * @param {number} l2Ttl - L2 缓存 TTL（秒）
+ * @returns {Promise<any>} 缓存值
+ */
+async function multiLevelCacheGet(key, fetchFn, l1Ttl = MEMORY_CACHE_TTL, l2Ttl = KV_CACHE_TTL) {
+  // 尝试 L1 缓存
+  let value = memGet(key);
+  if (value !== undefined) {
+    return value;
+  }
+
+  // 尝试 L2 缓存
+  value = await kvCacheGet(key);
+  if (value !== null) {
+    // 回填 L1 缓存
+    memSet(key, value, l1Ttl);
+    return value;
+  }
+
+  // 缓存未命中，调用 fetchFn 获取
+  value = await fetchFn();
+
+  // 同时写入 L1 和 L2 缓存
+  memSet(key, value, l1Ttl);
+  await kvCacheSet(key, value, l2Ttl);
+
+  return value;
+}
+
+/**
+ * 获取缓存统计信息
+ * @returns {object} 缓存统计
+ */
+function getCacheStats() {
+  const total = cacheStats.hits + cacheStats.misses;
+  const hitRate = total > 0 ? ((cacheStats.hits / total) * 100).toFixed(2) : 0;
+  const kvTotal = cacheStats.kvHits + cacheStats.kvMisses;
+  const kvHitRate = kvTotal > 0 ? ((cacheStats.kvHits / kvTotal) * 100).toFixed(2) : 0;
+
+  return {
+    l1: {
+      hits: cacheStats.hits,
+      misses: cacheStats.misses,
+      hitRate: hitRate + '%',
+      size: memCache.size
+    },
+    l2: {
+      hits: cacheStats.kvHits,
+      misses: cacheStats.kvMisses,
+      hitRate: kvHitRate + '%'
+    }
+  };
+}
+
+/**
+ * 清空所有缓存
+ */
+function clearAllCache() {
+  memCache.clear();
+  cacheStats.hits = 0;
+  cacheStats.misses = 0;
+  cacheStats.kvHits = 0;
+  cacheStats.kvMisses = 0;
 }
 
 // ========== KV 配额熔断保护 ==========
@@ -938,18 +2026,40 @@ async function processPendingMessagesAfterVerification(userId) {
   const uniqueIds = [...new Set(pendingIds)];
   const sortedIds = uniqueIds.sort((a, b) => a - b);
 
+  const topicEnabled = await isTopicForwardingEnabled();
+  let topicContext = null;
+  if (topicEnabled) {
+    topicContext = await ensureUserTopic(userId, await getUserProfile(userId));
+  }
+
+  const targetForPending = topicContext && topicContext.threadId
+    ? { chatId: GROUP_ID, threadId: topicContext.threadId, label: 'topic' }
+    : { chatId: ADMIN_UID, label: 'admin_dm' };
+
   // 【优化】批量处理，添加小延迟避免触发限制
   for (let i = 0; i < sortedIds.length; i++) {
     const msgId = sortedIds[i];
     try {
       // 尝试转发消息（通过复制方式）
-      const result = await forwardMessage({
-        chat_id: ADMIN_UID,
+      const payload = {
+        chat_id: targetForPending.chatId,
         from_chat_id: userId,
         message_id: msgId
-      });
+      };
+      if (targetForPending.threadId) {
+        payload.message_thread_id = targetForPending.threadId;
+      }
 
-      if (result.ok) {
+      const result = await forwardMessage(payload);
+
+      if (result.ok && result.result && result.result.message_id) {
+        forwarded++;
+        await storeForwardMapping(
+          result.result.message_id,
+          { chat: { id: userId }, message_id: msgId },
+          targetForPending
+        );
+      } else if (result.ok) {
         forwarded++;
       } else {
         // 【优化】区分错误类型：消息不存在 vs 其他错误
@@ -988,13 +2098,8 @@ async function processPendingMessagesAfterVerification(userId) {
     }
   }
 
-  // 通知用户
-  if (forwarded > 0) {
-    await sendMessage({
-      chat_id: userId,
-      text: `📩 刚才的 ${forwarded} 条消息已送达管理员。`
-    });
-  }
+  // 【修复】不再在此处通知用户，由调用方统一处理，避免重复通知
+  // 通知用户的功能已移至验证成功后的代码中
 
   Logger.info('pending_messages_processed', { userId, forwarded, failed });
   return { forwarded, failed };
@@ -1153,8 +2258,8 @@ const ADMIN_CACHE_TTL_MS = 5 * 60 * 1000; // 5分钟缓存
  * @returns {boolean} 是否为管理员
  */
 function isAdmin(userId) {
-  // 检查主管理员
-  if (String(userId) === String(ADMIN_UID)) {
+  // 检查主管理员和环境变量中的管理员
+  if (ADMIN_ALLOWLIST.has(String(userId))) {
     return true;
   }
 
@@ -1228,17 +2333,29 @@ function checkRateLimit(userId, type = 'message') {
   const config = RATE_LIMIT_CONFIG[type];
   if (!config) {
     Logger.warn('unknown_rate_limit_type', { type });
-    return { allowed: true, remaining: 999 };
+    return { allowed: true, remaining: 999, limit: 999 };
   }
 
   const now = Date.now();
   const key = `${config.keyPrefix}:${userId}`;
   let userData = rateLimitCache.get(key);
 
+  // 动态调整限额
+  let adjustedMaxRequests = config.maxRequests;
+  if (RATE_LIMIT_ENHANCED.enabledDynamicLimit) {
+    // 检查用户是否为信任用户
+    const isTrusted = memGet(`trusted:${userId}`);
+    if (isTrusted) {
+      adjustedMaxRequests = Math.floor(
+        config.maxRequests * RATE_LIMIT_ENHANCED.trustedUserMultiplier
+      );
+    }
+  }
+
   if (!userData) {
-    userData = { count: 1, firstRequest: now };
+    userData = { count: 1, firstRequest: now, violations: 0 };
     rateLimitCache.set(key, userData);
-    return { allowed: true, remaining: config.maxRequests - 1 };
+    return { allowed: true, remaining: adjustedMaxRequests - 1, limit: adjustedMaxRequests };
   }
 
   // 检查是否在时间窗口内
@@ -1246,17 +2363,40 @@ function checkRateLimit(userId, type = 'message') {
     // 重置窗口
     userData.count = 1;
     userData.firstRequest = now;
-    return { allowed: true, remaining: config.maxRequests - 1 };
+    userData.violations = 0;
+    rateLimitCache.set(key, userData);
+    return { allowed: true, remaining: adjustedMaxRequests - 1, limit: adjustedMaxRequests };
   }
 
   // 在窗口内，检查次数
-  if (userData.count >= config.maxRequests) {
+  if (userData.count >= adjustedMaxRequests) {
     const retryAfter = Math.ceil((config.windowMs - (now - userData.firstRequest)) / 1000);
-    return { allowed: false, retryAfter, limit: config.maxRequests };
+    userData.violations = (userData.violations || 0) + 1;
+
+    // 记录违规次数（用于分级限流）
+    if (userData.violations >= RATE_LIMIT_ENHANCED.maxPenaltyCount) {
+      Logger.warn('rate_limit_violation_excessive', {
+        userId,
+        type,
+        violations: userData.violations,
+        retryAfter
+      });
+    }
+
+    return {
+      allowed: false,
+      retryAfter,
+      limit: adjustedMaxRequests,
+      violations: userData.violations
+    };
   }
 
   userData.count++;
-  return { allowed: true, remaining: config.maxRequests - userData.count };
+  return {
+    allowed: true,
+    remaining: adjustedMaxRequests - userData.count,
+    limit: adjustedMaxRequests
+  };
 }
 
 /**
@@ -1371,7 +2511,13 @@ const CONFIG_KEYS = {
   WELCOME_MSG: 'config:welcome_msg',
   AUTO_REPLY_MSG: 'config:auto_reply_msg',
   VERIFY_TTL: 'config:verify_ttl',
-  UNION_BAN: 'config:union_ban'
+  UNION_BAN: 'config:union_ban',
+  FORWARD_MODE: 'config:forward_mode'
+};
+
+const FORWARD_MODES = {
+  DIRECT: 'direct',
+  TOPIC: 'topic'
 };
 
 async function getConfig(key, defaultValue = null) {
@@ -1389,6 +2535,127 @@ async function getConfig(key, defaultValue = null) {
 async function setConfig(key, value) {
   await KV.put(key, value);
   memSet(`cfg:${key}`, value);
+}
+
+async function getForwardMode() {
+  const mode = await getConfig(CONFIG_KEYS.FORWARD_MODE, FORWARD_MODES.DIRECT);
+  return mode === FORWARD_MODES.TOPIC ? FORWARD_MODES.TOPIC : FORWARD_MODES.DIRECT;
+}
+
+async function setForwardMode(mode) {
+  const next = mode === FORWARD_MODES.TOPIC ? FORWARD_MODES.TOPIC : FORWARD_MODES.DIRECT;
+  await setConfig(CONFIG_KEYS.FORWARD_MODE, next);
+  return next;
+}
+
+function hasTopicForwardingPrerequisites() {
+  return Boolean(GROUP_ID && ADMIN_UID);
+}
+
+async function getBotSelfProfile(force = false) {
+  const cached = memGet(BOT_SELF_CACHE_KEY);
+  if (cached && !force) return cached;
+
+  const result = await requestTelegram('getMe', {});
+  if (!result.ok || !result.result) {
+    throw new Error(result.description || 'getMe_failed');
+  }
+  memSet(BOT_SELF_CACHE_KEY, result.result, BOT_SELF_CACHE_TTL_MS);
+  return result.result;
+}
+
+async function performTopicEnvironmentCheck() {
+  if (!GROUP_ID) {
+    return { ok: false, reason: 'group_missing' };
+  }
+  try {
+    const chatInfo = await requestTelegram('getChat', { chat_id: GROUP_ID });
+    if (!chatInfo.ok) {
+      return { ok: false, reason: 'chat_inaccessible', description: chatInfo.description };
+    }
+    if (!chatInfo.result || chatInfo.result.is_forum === false) {
+      return { ok: false, reason: 'not_forum' };
+    }
+
+    const botProfile = await getBotSelfProfile();
+    const memberInfo = await requestTelegram('getChatMember', { chat_id: GROUP_ID, user_id: botProfile.id });
+    if (!memberInfo.ok) {
+      return { ok: false, reason: 'membership', description: memberInfo.description };
+    }
+    const rights = memberInfo.result;
+    if (rights.status !== 'administrator') {
+      return { ok: false, reason: 'not_admin' };
+    }
+    if (!rights.can_manage_topics) {
+      return { ok: false, reason: 'missing_manage_topics' };
+    }
+    return { ok: true };
+  } catch (e) {
+    Logger.error('topic_env_check_failed', e);
+    return { ok: false, reason: 'unknown', description: e.message };
+  }
+}
+
+async function verifyTopicEnvironment(options = {}) {
+  const { force = false, notifyOnFailure = true } = options;
+  if (!GROUP_ID) {
+    return { ok: false, reason: 'group_missing' };
+  }
+
+  if (!force) {
+    const cached = memGet(TOPIC_ENV_CACHE_KEY);
+    if (cached) return cached;
+  }
+
+  const status = await performTopicEnvironmentCheck();
+  memSet(TOPIC_ENV_CACHE_KEY, status, TOPIC_ENV_CACHE_TTL_MS);
+
+  if (!status.ok && notifyOnFailure) {
+    await maybeNotifyTopicEnvIssue(status);
+  }
+  return status;
+}
+
+function describeTopicEnvIssue(status) {
+  switch (status.reason) {
+    case 'group_missing':
+      return 'GROUP_ID is not configured.';
+    case 'chat_inaccessible':
+      return `bot cannot access the configured group (${status.description || 'unknown error'}).`;
+    case 'not_forum':
+      return 'the target group has not enabled Topics.';
+    case 'not_admin':
+      return 'the bot is not an administrator in the group.';
+    case 'missing_manage_topics':
+      return 'the bot is missing the Manage Topics permission.';
+    case 'membership':
+      return `unable to read bot permissions: ${status.description || 'unknown error'}.`;
+    default:
+      return status.description || 'unexpected error while checking the forum group.';
+  }
+}
+
+async function maybeNotifyTopicEnvIssue(status) {
+  if (!ADMIN_UID) return;
+  const last = memGet(TOPIC_ENV_ALERT_CACHE_KEY);
+  if (last && Date.now() - last < TOPIC_ENV_ALERT_COOLDOWN_MS) return;
+
+  memSet(TOPIC_ENV_ALERT_CACHE_KEY, Date.now(), TOPIC_ENV_ALERT_COOLDOWN_MS);
+  const text = `[Notice] Topic mode is unavailable: ${describeTopicEnvIssue(status)}`;
+  try {
+    await sendMessage({
+      chat_id: ADMIN_UID,
+      text
+    });
+  } catch (e) {
+    Logger.warn('topic_env_notice_failed', e);
+  }
+}
+
+async function isTopicForwardingEnabled() {
+  if (!hasTopicForwardingPrerequisites()) return false;
+  const mode = await getForwardMode();
+  return mode === FORWARD_MODES.TOPIC;
 }
 
 // 错误上报
@@ -1608,6 +2875,9 @@ function classifyTelegramError(description) {
   const desc = description.toLowerCase();
 
   // 消息相关错误
+  if (desc.includes('message thread not found') || desc.includes('topic not found')) {
+    return 'thread_not_found';
+  }
   if (desc.includes('message to forward not found') || desc.includes('message not found')) {
     return 'message_not_found';
   }
@@ -1749,8 +3019,27 @@ function copyMessage(msg = {}) {
   return requestTelegram('copyMessage', msg);
 }
 
-function forwardMessage(msg) {
-  return requestTelegram('forwardMessage', msg);
+async function forwardMessage(msg = {}) {
+  const result = await requestTelegram('forwardMessage', msg);
+  if (shouldFallbackToCopy(result)) {
+    return requestTelegram('copyMessage', msg);
+  }
+  return result;
+}
+
+async function forwardMessagesWithFallback(msg = {}) {
+  const result = await requestTelegram('forwardMessages', msg);
+  if (shouldFallbackToCopy(result)) {
+    return requestTelegram('copyMessages', msg);
+  }
+  return result;
+}
+
+function shouldFallbackToCopy(result) {
+  if (!result || result.ok) return false;
+  if (result.errorType === 'message_not_found') return true;
+  const desc = (result.description || '').toLowerCase();
+  return desc.includes('message to forward not found') || desc.includes('content private');
 }
 
 // 设置 Telegram 命令列表
@@ -1760,7 +3049,7 @@ async function setBotCommands() {
     { command: 'menu', description: '管理菜单' },
     { command: 'ban', description: '封禁用户' },
     { command: 'unban', description: '解除封禁' },
-    { command: 'unverify', description: '取消验证' },
+    { command: 'reset', description: '重置验证' },
     { command: 'trust', description: '信任用户' },
     { command: 'untrust', description: '取消信任' },
     { command: 'broadcast', description: '广播消息' },
@@ -1771,10 +3060,13 @@ async function setBotCommands() {
 
   try {
     // 为管理员设置命令列表
-    await requestTelegram('setMyCommands', {
-      commands: adminCommands,
-      scope: { type: 'chat', chat_id: ADMIN_UID }
-    });
+    const adminTargets = ADMIN_ID_LIST.length ? ADMIN_ID_LIST : (ADMIN_UID ? [ADMIN_UID] : []);
+    for (const adminId of adminTargets) {
+      await requestTelegram('setMyCommands', {
+        commands: adminCommands,
+        scope: { type: 'chat', chat_id: adminId }
+      });
+    }
     Logger.info('admin_commands_set');
   } catch (e) {
     Logger.error('set_admin_commands_failed', e);
@@ -1792,7 +3084,7 @@ function validateEnvironment() {
   // 检查必需变量
   if (!TOKEN) missing.push('ENV_BOT_TOKEN');
   if (!SECRET) missing.push('ENV_BOT_SECRET');
-  if (!ADMIN_UID) missing.push('ENV_ADMIN_UID');
+  if (!ADMIN_ID_LIST.length) missing.push('ENV_ADMIN_UID 或 ADMIN_IDS');
 
   if (missing.length > 0) {
     return {
@@ -1808,8 +3100,16 @@ function validateEnvironment() {
   }
 
   // 验证 ADMIN_UID 是否为数字
-  if (!/^-?\d+$/.test(String(ADMIN_UID))) {
+  if (RAW_ADMIN_UID && !/^-?\d+$/.test(String(RAW_ADMIN_UID))) {
     invalid.push('ENV_ADMIN_UID (should be a numeric ID)');
+  }
+
+  if (ADMIN_IDS_ENV) {
+    const rawIds = ADMIN_IDS_ENV.split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
+    const invalidIds = rawIds.filter(id => !/^-?\d+$/.test(id));
+    if (invalidIds.length) {
+      invalid.push('ADMIN_IDS (all entries must be numeric Telegram user IDs)');
+    }
   }
 
   // 验证 SECRET 长度（建议至少 16 个字符）
@@ -1859,10 +3159,6 @@ addEventListener('fetch', event => {
 });
 
 async function handleWebhook(event, url) {
-  if (event.request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== SECRET) {
-    return new Response('Unauthorized', { status: 403 });
-  }
-
   const update = await event.request.json();
   event.waitUntil(onUpdate(update, url.origin));
   return new Response('Ok');
@@ -1896,6 +3192,8 @@ async function onUpdate(update, origin) {
 
 async function onMessage(message, origin) {
   const chatId = message.chat.id.toString();
+  const senderId = message.from ? String(message.from.id) : null;
+  const isGroupAdminChat = GROUP_ID && chatId === GROUP_ID;
 
   // 缓存用户资料（从消息中）
   if (message.from) {
@@ -1903,7 +3201,7 @@ async function onMessage(message, origin) {
   }
 
   // 1. 如果是管理员发消息
-  if (isAdmin(chatId)) {
+  if (isAdmin(chatId) || (isGroupAdminChat && senderId && isAdmin(senderId))) {
     return handleAdminMessage(message);
   }
 
@@ -1990,8 +3288,25 @@ async function onMessage(message, origin) {
 
     if (isVerified) {
       // 4. 检查垃圾消息过滤
-      const spamCheck = await checkSpam(message);
+      const spamCheck = await checkSpam(message, chatId);
       if (spamCheck.isSpam) {
+        // 检查垃圾话题功能是否启用
+        const spamTopicEnabled = await isSpamTopicEnabled();
+        const spamTopicConfig = await getSpamTopicConfig();
+
+        if (spamTopicEnabled && spamTopicConfig.topicId && GROUP_ID) {
+          // 静默转发到垃圾话题
+          const forwarded = await silentlyForwardSpamMessage(message, GROUP_ID, spamTopicConfig.topicId);
+          if (forwarded) {
+            // 用户无感知，不返回错误消息
+            return sendMessage({
+              chat_id: chatId,
+              text: '✅ 消息已发送'  // 假装成功发送
+            });
+          }
+        }
+
+        // 传统模式：拦截并通知管理员
         // 记录垃圾消息
         await sendMessage({
           chat_id: ADMIN_UID,
@@ -2081,6 +3396,18 @@ async function getTargetId(message, commandName) {
   const text = (message.text || '').trim();
   const args = text.split(/\s+/);
   const reply = message.reply_to_message;
+  const contextChatId = message.chat?.id ? String(message.chat.id) : null;
+
+  // 【话题模式支持】如果消息来自话题，直接从话题 ID 获取用户 UID
+  const isTopicMode = await isTopicForwardingEnabled();
+  if (isTopicMode && contextChatId === GROUP_ID && message.message_thread_id) {
+    const threadId = message.message_thread_id;
+    const userId = await KV.get(`thread:${threadId}`);
+    if (userId) {
+      Logger.info('get_target_id_from_topic', { commandName, threadId, userId });
+      return userId;
+    }
+  }
 
   // 优先 1：从回复的消息中提取
   if (reply && (reply.forward_from || reply.forward_sender_name)) {
@@ -2160,28 +3487,36 @@ async function generateMainMenu() {
   const unionBanEnabled = await getConfig(CONFIG_KEYS.UNION_BAN, '0');
   const verifyMode = await getVerifyMode();
   const spamFilterEnabled = await getSpamFilterEnabled();
+  const aiConfig = await getAISpamDetectionConfig();
+  const forwardMode = await getForwardMode();
 
   const welcomeStatus = welcomeMsg ? '🟢' : '⚪️';
   const autoReplyStatus = autoReplyMsg ? '🟢' : '⚪️';
   const unionBanStatus = (unionBanEnabled === '1' || unionBanEnabled === 'true') ? '🟢' : '🔴';
   const spamFilterStatus = spamFilterEnabled ? '🟢' : '🔴';
+  const aiStatus = aiConfig.enabled ? '🟢' : '⚪️';
+  const forwardStatus = forwardMode === FORWARD_MODES.TOPIC ? '💬 话题' : '📥 私聊';
 
   const text = `🛠 <b>SafeRelay 管理面板</b>
 
   📊 <b>当前配置:</b>
-  🔸 验证模式: ${getVerifyModeName(verifyMode)}
+  🔸 验证模式：${getVerifyModeName(verifyMode)}
   🔸 垃圾过滤 ${spamFilterStatus}
+  🔸 AI 检测 ${aiStatus}
   🔸 联合封禁 ${unionBanStatus}
   🔸 欢迎消息 ${welcomeStatus}
   🔸 自动回复 ${autoReplyStatus}
+  🔸 转发模式 ${forwardStatus}
 
   👇 点击下方按钮进入设置`;
 
   const keyboard = {
     inline_keyboard: [
       [{ text: '🛡 验证模式', callback_data: 'submenu_verify' }, { text: '🗑 垃圾过滤', callback_data: 'submenu_spam' }],
+      [{ text: '🤖 AI 检测', callback_data: 'submenu_ai' }, { text: '🗑 垃圾话题', callback_data: 'submenu_spamtopic' }],
       [{ text: '🌐 联合封禁', callback_data: 'submenu_union' }, { text: '👥 用户管理', callback_data: 'submenu_users' }],
       [{ text: '👋 欢迎消息', callback_data: 'submenu_welcome' }, { text: '🤖 自动回复', callback_data: 'submenu_autoreply' }],
+      [{ text: '💬 转发模式', callback_data: 'submenu_forward' }],
       [{ text: '📊 统计信息', callback_data: 'submenu_stats' }]
     ]
   };
@@ -2212,7 +3547,178 @@ ${formatSpamRules(rules)}
   const keyboard = {
     inline_keyboard: [
       [{ text: enabled ? '🔴 关闭过滤' : '🟢 开启过滤', callback_data: 'toggle_spam_filter' }],
+      [{ text: '🔑 关键词管理', callback_data: 'manage_keywords' }],
       [{ text: '🔄 重置为默认规则', callback_data: 'reset_spam_rules' }],
+      [{ text: '◀️ 返回主菜单', callback_data: 'back_to_main' }]
+    ]
+  };
+
+  return { text, reply_markup: keyboard };
+}
+
+// 生成关键词管理子菜单
+async function generateKeywordManagementSubmenu() {
+  const rules = await getSpamFilterRules();
+  const keywords = rules.keywords || [];
+  const allowKeywords = rules.allowKeywords || [];
+  const regexes = rules.regexes || [];
+  const allowRegexes = rules.allowRegexes || [];
+
+  const text = `🔑 <b>关键词规则管理</b>
+
+<b>拦截关键词 (${keywords.length}个):</b>
+${formatKeywordList(keywords, 10)}
+
+<b>放行关键词 (${allowKeywords.length}个):</b>
+${formatKeywordList(allowKeywords, 5)}
+
+<b>拦截正则 (${regexes.length}个):</b>
+${formatKeywordList(regexes, 3)}
+
+<b>放行正则 (${allowRegexes.length}个):</b>
+${formatKeywordList(allowRegexes, 3)}
+
+<b>管理方法:</b>
+• 添加拦截词：直接发送关键词
+• 添加放行词：<code>allow:关键词</code>
+• 添加正则：<code>regex:正则表达式</code>
+• 删除拦截词：<code>del:关键词</code>
+• 删除放行词：<code>delallow:关键词</code>
+• 清空所有：<code>清空默认</code>
+
+💡 关键词和正则会立即生效`;
+
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '📋 查看完整列表', callback_data: 'view_all_keywords' }],
+      [{ text: '🗑️ 清空拦截词', callback_data: 'clear_keywords' }],
+      [{ text: '🔄 恢复默认规则', callback_data: 'reset_spam_rules' }],
+      [{ text: '◀️ 返回过滤设置', callback_data: 'back_to_spam_filter' }]
+    ]
+  };
+
+  return { text, reply_markup: keyboard };
+}
+
+// 格式化关键词列表（用于显示）
+function formatKeywordList(keywords, maxDisplay = 10) {
+  if (!keywords || keywords.length === 0) {
+    return '<i>(空)</i>';
+  }
+
+  const display = keywords.slice(0, maxDisplay);
+  const text = display.map(k => `• <code>${escapeHtml(k)}</code>`).join('\n');
+
+  if (keywords.length > maxDisplay) {
+    return text + `\n... 还有 ${keywords.length - maxDisplay} 个`;
+  }
+
+  return text;
+}
+
+// 生成 AI 检测设置子菜单
+async function generateAISpamSubmenu() {
+  const aiConfig = await getAISpamDetectionConfig();
+  const rateLimit = await checkAIRateLimit();
+
+  const text = `🤖 <b>AI 垃圾检测设置</b>
+
+当前状态：<b>${aiConfig.enabled ? '🟢 已开启' : '🔴 已关闭'}</b>
+
+<b>配置信息:</b>
+🔹 置信度阈值：${aiConfig.confidenceThreshold || 0.7}
+🔹 每小时限额：${CONFIG.AI_RATE_LIMIT_PER_HOUR} 次
+🔹 剩余次数：${rateLimit.remaining} 次
+${!rateLimit.allowed ? `🔹 重置时间：${rateLimit.resetAfter} 秒后` : ''}
+
+<b>使用说明:</b>
+• AI 检测作为关键词过滤的补充
+• 自动识别广告、推广、投资等垃圾内容
+• 需要配置 Cloudflare Workers AI
+
+<b>环境变量:</b>
+<code>CF_ACCOUNT_ID</code> - Cloudflare Account ID
+<code>CF_AI_TOKEN</code> - Cloudflare AI API Token
+
+💡 建议：先使用关键词过滤，AI 作为兜底策略`;
+
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: aiConfig.enabled ? '🔴 关闭 AI 检测' : '🟢 开启 AI 检测', callback_data: 'toggle_ai_detection' }],
+      [{ text: '⚙️ 调整置信度', callback_data: 'ai_confidence' }],
+      [{ text: '📊 查看使用统计', callback_data: 'ai_stats' }],
+      [{ text: '◀️ 返回主菜单', callback_data: 'back_to_main' }]
+    ]
+  };
+
+  return { text, reply_markup: keyboard };
+}
+
+// 生成垃圾话题设置子菜单
+async function generateSpamTopicSubmenu() {
+  const config = await getSpamTopicConfig();
+  const spamFilterEnabled = await getSpamFilterEnabled();
+  const aiEnabled = await isAISpamDetectionEnabled();
+
+  const text = `🗑 <b>垃圾话题管理设置</b>
+
+当前状态：<b>${config.enabled ? '🟢 已开启' : '🔴 已关闭'}</b>
+
+<b>配置信息:</b>
+🔹 垃圾话题 ID: ${config.topicId || '(未设置)'}
+🔹 自动创建：${config.autoCreate ? '✅' : '❌'}
+🔹 管理员通知：${config.notifyAdmin ? '✅' : '❌'}
+
+<b>关联功能:</b>
+🔸 垃圾过滤：${spamFilterEnabled ? '🟢' : '🔴'}
+🔸 AI 检测：${aiEnabled ? '🟢' : '🔴'}
+
+<b>使用说明:</b>
+• 垃圾话题用于隔离垃圾消息
+• 可选择静默转发（用户无感知）
+• 管理员可随时查看和恢复消息
+
+<b>操作步骤:</b>
+1. 配置群组 ID（论坛群组）
+2. 点击"自动创建话题"或手动指定
+3. 开启垃圾话题功能
+4. 配合垃圾过滤和 AI 检测使用`;
+
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: config.enabled ? '🔴 关闭垃圾话题' : '🟢 开启垃圾话题', callback_data: 'toggle_spam_topic' }],
+      [{ text: '🏗️ 自动创建话题', callback_data: 'create_spam_topic' }],
+      [{ text: '⚙️ 配置话题 ID', callback_data: 'config_spam_topic_id' }],
+      [{ text: '📊 查看垃圾消息', callback_data: 'view_spam_messages' }],
+      [{ text: '◀️ 返回主菜单', callback_data: 'back_to_main' }]
+    ]
+  };
+
+  return { text, reply_markup: keyboard };
+}
+
+async function generateForwardModeSubmenu() {
+  const mode = await getForwardMode();
+  const issues = [];
+  if (!GROUP_ID) issues.push('• 未设置 GROUP_ID 环境变量');
+  if (!ADMIN_UID) issues.push('• 未设置 ENV_ADMIN_UID（主管理员）');
+
+  const text = `💬 <b>消息转发模式</b>
+
+当前模式：<b>${mode === FORWARD_MODES.TOPIC ? '话题模式（论坛群组）' : '私聊模式（管理员私聊）'}</b>
+
+<b>说明：</b>
+• 私聊模式：所有消息只发到管理员私聊
+• 话题模式：每个访客自动创建话题，消息转发到论坛群组
+
+${issues.length ? '<b>启用话题模式前请完成：</b>\n' + issues.join('\n') : '✅ 话题模式条件已满足，可随时开启。'}
+
+在话题模式下，请确保机器人是群组管理员并具备「管理话题」权限。`;
+
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: (mode === FORWARD_MODES.DIRECT ? '✅ ' : '') + '📥 私聊转发', callback_data: 'forward_mode:direct' }],
+      [{ text: (mode === FORWARD_MODES.TOPIC ? '✅ ' : '') + '💬 话题转发', callback_data: 'forward_mode:topic' }],
       [{ text: '◀️ 返回主菜单', callback_data: 'back_to_main' }]
     ]
   };
@@ -2238,7 +3744,7 @@ async function generateVerifySubmenu() {
 
   if (!turnstileAvailable) {
     text += `⚠️ <b>注意:</b> 未检测到 Turnstile 配置，只能使用本地题库验证。
-请在代码中配置 CF_TURNSTILE_SITE_KEY 和 CF_TURNSTILE_SECRET_KEY 后使用其他模式。`;
+请在环境变量中配置 CF_TURNSTILE_SITE_KEY 和 CF_TURNSTILE_SECRET_KEY 后使用其他模式。`;
   }
 
   const keyboard = {
@@ -2487,6 +3993,7 @@ async function handleAdminCallback(callbackQuery) {
   const data = callbackQuery.data;
   const chatId = callbackQuery.message.chat.id;
   const messageId = callbackQuery.message.message_id;
+  const adminChatId = String(callbackQuery.from.id); // 使用回调用户的 ID
 
   // 返回主菜单
   if (data === 'back_to_main') {
@@ -2526,6 +4033,104 @@ async function handleAdminCallback(callbackQuery) {
     return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id });
   }
 
+  // 关键词管理 - 进入子菜单
+  if (data === 'manage_keywords') {
+    const menu = await generateKeywordManagementSubmenu();
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id });
+  }
+
+  // 关键词管理 - 查看完整列表
+  if (data === 'view_all_keywords') {
+    const rules = await getSpamFilterRules();
+    const allKeywords = [
+      '=== 拦截关键词 ===',
+      ...(rules.keywords || []),
+      '',
+      '=== 放行关键词 ===',
+      ...(rules.allowKeywords || []),
+      '',
+      '=== 拦截正则 ===',
+      ...(rules.regexes || []),
+      '',
+      '=== 放行正则 ===',
+      ...(rules.allowRegexes || [])
+    ].join('\n');
+
+    await requestTelegram('sendMessage', {
+      chat_id: chatId,
+      text: `<b>完整规则列表:</b>\n<pre>${escapeHtml(allKeywords)}</pre>`,
+      parse_mode: 'HTML'
+    });
+
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id });
+  }
+
+  // 关键词管理 - 清空拦截词
+  if (data === 'clear_keywords') {
+    const rules = await getSpamFilterRules();
+    rules.keywords = [];
+    rules.regexes = [];
+    await setSpamFilterRules(rules);
+
+    const menu = await generateKeywordManagementSubmenu();
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+
+    return requestTelegram('answerCallbackQuery', {
+      callback_query_id: callbackQuery.id,
+      text: '✅ 已清空所有拦截关键词和正则'
+    });
+  }
+
+  // 关键词管理 - 返回过滤设置
+  if (data === 'back_to_spam_filter') {
+    const menu = await generateSpamFilterSubmenu();
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id });
+  }
+
+  if (data === 'submenu_ai') {
+    const menu = await generateAISpamSubmenu();
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id });
+  }
+
+  if (data === 'submenu_spamtopic') {
+    const menu = await generateSpamTopicSubmenu();
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id });
+  }
+
   if (data === 'submenu_union') {
     const menu = await generateUnionBanSubmenu();
     await requestTelegram('editMessageText', {
@@ -2552,6 +4157,54 @@ async function handleAdminCallback(callbackQuery) {
 
   if (data === 'submenu_autoreply') {
     const menu = await generateAutoreplySubmenu();
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id });
+  }
+
+  if (data.startsWith('forward_mode:')) {
+    const mode = data.split(':')[1];
+    if (mode === FORWARD_MODES.TOPIC && !hasTopicForwardingPrerequisites()) {
+      return requestTelegram('answerCallbackQuery', {
+        callback_query_id: callbackQuery.id,
+        text: '⚠️ 请先在环境变量中配置 GROUP_ID 和 ENV_ADMIN_UID',
+        show_alert: true
+      });
+    }
+
+    if (mode === FORWARD_MODES.TOPIC) {
+      const readiness = await verifyTopicEnvironment({ force: true, notifyOnFailure: false });
+      if (!readiness.ok) {
+        return requestTelegram('answerCallbackQuery', {
+          callback_query_id: callbackQuery.id,
+          text: `Topic mode unavailable: ${describeTopicEnvIssue(readiness)}`,
+          show_alert: true
+        });
+      }
+    }
+
+    const applied = await setForwardMode(mode === FORWARD_MODES.TOPIC ? FORWARD_MODES.TOPIC : FORWARD_MODES.DIRECT);
+    const menu = await generateForwardModeSubmenu();
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', {
+      callback_query_id: callbackQuery.id,
+      text: applied === FORWARD_MODES.TOPIC ? '已切换到话题模式' : '已切换到私聊模式'
+    });
+  }
+
+  if (data === 'submenu_forward') {
+    const menu = await generateForwardModeSubmenu();
     await requestTelegram('editMessageText', {
       chat_id: chatId,
       message_id: messageId,
@@ -2671,6 +4324,287 @@ async function handleAdminCallback(callbackQuery) {
     });
   }
 
+  // AI 检测 - 切换状态
+  if (data === 'toggle_ai_detection') {
+    const aiConfig = await getAISpamDetectionConfig();
+    await setAISpamDetectionConfig({
+      enabled: !aiConfig.enabled,
+      confidenceThreshold: aiConfig.confidenceThreshold || 0.7
+    });
+
+    const menu = await generateAISpamSubmenu();
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', {
+      callback_query_id: callbackQuery.id,
+      text: !aiConfig.enabled ? 'AI 检测已开启' : 'AI 检测已关闭'
+    });
+  }
+
+  // 垃圾话题 - 切换状态
+  if (data === 'toggle_spam_topic') {
+    const config = await getSpamTopicConfig();
+    await setSpamTopicConfig({
+      ...config,
+      enabled: !config.enabled
+    });
+
+    const menu = await generateSpamTopicSubmenu();
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', {
+      callback_query_id: callbackQuery.id,
+      text: !config.enabled ? '垃圾话题已开启' : '垃圾话题已关闭'
+    });
+  }
+
+  // 垃圾话题 - 自动创建
+  if (data === 'create_spam_topic') {
+    const groupId = GROUP_ID;
+    if (!groupId) {
+      return requestTelegram('answerCallbackQuery', {
+        callback_query_id: callbackQuery.id,
+        text: '❌ 未配置群组 ID',
+        show_alert: true
+      });
+    }
+
+    // 检查是否已有垃圾话题
+    const config = await getSpamTopicConfig();
+    if (config.topicId) {
+      // 提供强制重新创建的选项
+      const text = `⚠️ <b>垃圾话题已存在</b>
+
+当前话题 ID: <code>${config.topicId}</code>
+
+<b>选项:</b>
+• 如果话题已被删除，请点击"强制重新创建"
+• 如果想使用新话题，请先删除旧话题或手动指定新 ID
+• 如果话题正常，请直接使用现有话题`;
+
+      const keyboard = {
+        inline_keyboard: [
+          [{ text: '🔄 强制重新创建', callback_data: 'force_create_spam_topic' }],
+          [{ text: '❌ 取消', callback_data: 'back_to_spamtopic_menu' }]
+        ]
+      };
+
+      await requestTelegram('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        text: text,
+        parse_mode: 'HTML',
+        reply_markup: keyboard
+      });
+
+      return requestTelegram('answerCallbackQuery', {
+        callback_query_id: callbackQuery.id,
+        text: '垃圾话题已存在'
+      });
+    }
+
+    const topicId = await createSpamTopic(groupId);
+    if (topicId) {
+      await setSpamTopicConfig({
+        ...config,
+        topicId: topicId
+      });
+
+      const menu = await generateSpamTopicSubmenu();
+      await requestTelegram('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        text: menu.text,
+        parse_mode: 'HTML',
+        reply_markup: menu.reply_markup
+      });
+      return requestTelegram('answerCallbackQuery', {
+        callback_query_id: callbackQuery.id,
+        text: `✅ 话题已创建，ID: <code>${topicId}</code>`
+      });
+    } else {
+      return requestTelegram('answerCallbackQuery', {
+        callback_query_id: callbackQuery.id,
+        text: '❌ 创建话题失败，请检查机器人是否为群组管理员',
+        show_alert: true
+      });
+    }
+  }
+
+  // 垃圾话题 - 强制重新创建
+  if (data === 'force_create_spam_topic') {
+    const groupId = GROUP_ID;
+    if (!groupId) {
+      return requestTelegram('answerCallbackQuery', {
+        callback_query_id: callbackQuery.id,
+        text: '❌ 未配置群组 ID',
+        show_alert: true
+      });
+    }
+
+    const config = await getSpamTopicConfig();
+    const topicId = await createSpamTopic(groupId);
+    if (topicId) {
+      // 更新配置
+      await setSpamTopicConfig({
+        ...config,
+        topicId: topicId
+      });
+
+      const menu = await generateSpamTopicSubmenu();
+      await requestTelegram('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        text: menu.text,
+        parse_mode: 'HTML',
+        reply_markup: menu.reply_markup
+      });
+      return requestTelegram('answerCallbackQuery', {
+        callback_query_id: callbackQuery.id,
+        text: `✅ 话题已重新创建，ID: <code>${topicId}</code>`
+      });
+    } else {
+      return requestTelegram('answerCallbackQuery', {
+        callback_query_id: callbackQuery.id,
+        text: '❌ 创建话题失败，可能话题名称重复或机器人权限不足',
+        show_alert: true
+      });
+    }
+  }
+
+  // 返回垃圾话题菜单
+  if (data === 'back_to_spamtopic_menu') {
+    const menu = await generateSpamTopicSubmenu();
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', {
+      callback_query_id: callbackQuery.id,
+      text: '已返回垃圾话题菜单'
+    });
+  }
+
+  // 垃圾话题 - 配置话题 ID
+  if (data === 'config_spam_topic_id') {
+    const config = await getSpamTopicConfig();
+
+    // 提示用户输入话题 ID
+    const text = `⚙️ <b>配置垃圾话题 ID</b>
+
+当前话题 ID: <code>${config.topicId || '(未设置)'}</code>
+
+<b>使用方法:</b>
+1. 在群组中手动创建一个话题
+2. 复制话题 ID（可以通过转发话题中的消息获取）
+3. 发送话题 ID 完成配置
+
+<b>或者:</b>
+• 发送 "自动创建" 让机器人自动创建话题
+• 发送 "取消" 放弃配置`;
+
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: '◀️ 返回垃圾话题菜单', callback_data: 'back_to_spamtopic_menu' }]
+      ]
+    };
+
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: text,
+      parse_mode: 'HTML',
+      reply_markup: keyboard
+    });
+
+    // 设置一个临时状态，等待用户输入
+    await KV.put(`spam_topic_config_wait:${adminChatId}`, 'config');
+    // 保存菜单信息
+    await KV.put(`spam_topic_menu:${adminChatId}`, JSON.stringify({
+      chatId: chatId,
+      messageId: messageId
+    }), { expirationTtl: 300 });
+
+    return requestTelegram('answerCallbackQuery', {
+      callback_query_id: callbackQuery.id,
+      text: '请发送话题 ID 或 "自动创建"'
+    });
+  }
+
+  // 垃圾话题 - 查看垃圾消息
+  if (data === 'view_spam_messages') {
+    const config = await getSpamTopicConfig();
+
+    if (!config.topicId) {
+      return requestTelegram('answerCallbackQuery', {
+        callback_query_id: callbackQuery.id,
+        text: '❌ 未配置垃圾话题，请先创建或配置话题 ID',
+        show_alert: true
+      });
+    }
+
+    if (!GROUP_ID) {
+      return requestTelegram('answerCallbackQuery', {
+        callback_query_id: callbackQuery.id,
+        text: '❌ 未配置群组 ID',
+        show_alert: true
+      });
+    }
+
+    // 发送跳转到垃圾话题的链接
+    const topicLink = `https://t.me/c/${GROUP_ID.replace('-100', '')}/${config.topicId}`;
+    const text = `📊 <b>查看垃圾消息</b>
+
+<b>垃圾话题 ID:</b> <code>${config.topicId}</code>
+<b>话题链接:</b> <a href="${topicLink}">点击跳转</a>
+
+<b>统计信息:</b>
+• 垃圾话题功能：${config.enabled ? '🟢 已开启' : '🔴 已关闭'}
+• 管理员通知：${config.notifyAdmin ? '✅' : '❌'}
+
+<b>说明:</b>
+• 所有被标记为垃圾的消息会自动转发到垃圾话题
+• 您可以在话题中查看和恢复误判的消息
+• 恢复消息请回复该消息并发送 /restore
+
+<b>快捷操作:</b>
+• 点击话题链接直接跳转到 Telegram 话题
+• 返回菜单可重新查看`;
+
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: '🔗 打开话题', url: topicLink }],
+        [{ text: '◀️ 返回垃圾话题菜单', callback_data: 'back_to_spamtopic_menu' }]
+      ]
+    };
+
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: text,
+      parse_mode: 'HTML',
+      reply_markup: keyboard
+    });
+
+    return requestTelegram('answerCallbackQuery', {
+      callback_query_id: callbackQuery.id,
+      text: '已显示垃圾话题信息'
+    });
+  }
+
   // 联合封禁 - 切换状态
   if (data === 'toggle_union') {
     const currentVal = await getConfig(CONFIG_KEYS.UNION_BAN, '0');
@@ -2732,7 +4666,7 @@ async function handleAdminCallback(callbackQuery) {
   // 广播控制按钮
   if (data.startsWith('bcontinue:')) {
     const offset = parseInt(data.split(':')[1]) || 0;
-    const broadcastMsg = await KV.get(`broadcast_msg:${ADMIN_UID}`);
+    const broadcastMsg = await KV.get(`broadcast_msg:${adminChatId}`);
 
     if (!broadcastMsg) {
       await requestTelegram('editMessageText', {
@@ -2769,7 +4703,7 @@ async function handleAdminCallback(callbackQuery) {
   }
 
   if (data === 'bcancel') {
-    await KV.delete(`broadcast_msg:${ADMIN_UID}`);
+    await KV.delete(`broadcast_msg:${adminChatId}`);
     await requestTelegram('editMessageText', {
       chat_id: chatId,
       message_id: messageId,
@@ -2790,6 +4724,146 @@ function escapeHtml(unsafe) {
 async function handleAdminMessage(message) {
   const text = (message.text || '').trim();
   const reply = message.reply_to_message;
+  const contextChatId = message.chat?.id ? String(message.chat.id) : null;
+  const senderId = message.from ? String(message.from.id) : null;
+  const adminChatId = senderId || ADMIN_UID || contextChatId;
+  const replyChatId = reply ? (reply.chat?.id ? String(reply.chat.id) : (contextChatId || adminChatId)) : null;
+
+  // 【话题模式支持】检测是否在话题中发送消息
+  const isTopicMode = await isTopicForwardingEnabled();
+  const isInTopic = isTopicMode && contextChatId === GROUP_ID && message.message_thread_id;
+
+  // 辅助函数：获取回复目标（话题模式或私聊模式）
+  const getReplyTarget = () => {
+    if (isInTopic) {
+      return {
+        chat_id: contextChatId,
+        message_thread_id: message.message_thread_id
+      };
+    }
+    return {
+      chat_id: adminChatId
+    };
+  };
+
+  // 【垃圾话题配置】检查是否在配置垃圾话题 ID 的等待状态
+  const spamTopicWaitKey = `spam_topic_config_wait:${adminChatId}`;
+  const isWaitingForSpamTopicId = await KV.get(spamTopicWaitKey);
+  if (isWaitingForSpamTopicId) {
+    await KV.delete(spamTopicWaitKey);
+
+    // 获取最后一个菜单消息 ID（从 KV 中存储）
+    const lastMenuKey = `spam_topic_menu:${adminChatId}`;
+    const lastMenuInfo = await KV.get(lastMenuKey);
+    let lastMenuId = null;
+    let lastChatId = adminChatId;
+    if (lastMenuInfo) {
+      try {
+        const info = JSON.parse(lastMenuInfo);
+        lastMenuId = info.messageId;
+        lastChatId = info.chatId;
+      } catch (e) {
+        // 忽略解析错误
+      }
+    }
+
+    if (text.toLowerCase() === '取消') {
+      if (lastMenuId) {
+        const menu = await generateSpamTopicSubmenu();
+        await requestTelegram('editMessageText', {
+          chat_id: lastChatId,
+          message_id: lastMenuId,
+          text: menu.text,
+          parse_mode: 'HTML',
+          reply_markup: menu.reply_markup
+        });
+      }
+      return sendMessage({
+        chat_id: adminChatId,
+        text: '❌ 已取消配置垃圾话题 ID'
+      });
+    }
+
+    if (text.toLowerCase() === '自动创建') {
+      const topicId = await createSpamTopic(GROUP_ID);
+      if (topicId) {
+        const config = await getSpamTopicConfig();
+        await setSpamTopicConfig({
+          ...config,
+          topicId: topicId
+        });
+
+        if (lastMenuId) {
+          const menu = await generateSpamTopicSubmenu();
+          await requestTelegram('editMessageText', {
+            chat_id: lastChatId,
+            message_id: lastMenuId,
+            text: menu.text,
+            parse_mode: 'HTML',
+            reply_markup: menu.reply_markup
+          });
+        }
+
+        return sendMessage({
+          chat_id: adminChatId,
+          text: `✅ 垃圾话题已自动创建，ID: <code>${topicId}</code>\n\n请在菜单中开启垃圾话题功能`
+        });
+      } else {
+        return sendMessage({
+          chat_id: adminChatId,
+          text: '❌ 自动创建失败，请检查机器人是否为群组管理员'
+        });
+      }
+    }
+
+    // 尝试解析话题 ID（支持纯数字或带链接格式）
+    let topicId = text.trim();
+    const urlMatch = text.match(/\/c\/(\d+)\/(\d+)/);
+    if (urlMatch) {
+      topicId = urlMatch[2];
+    }
+
+    if (!/^\d+$/.test(topicId)) {
+      return sendMessage({
+        chat_id: adminChatId,
+        text: '❌ 无效的话题 ID，请输入纯数字或话题链接'
+      });
+    }
+
+    const config = await getSpamTopicConfig();
+    await setSpamTopicConfig({
+      ...config,
+      topicId: topicId
+    });
+
+    // 刷新菜单
+    if (lastMenuId) {
+      const menu = await generateSpamTopicSubmenu();
+      await requestTelegram('editMessageText', {
+        chat_id: lastChatId,
+        message_id: lastMenuId,
+        text: menu.text,
+        parse_mode: 'HTML',
+        reply_markup: menu.reply_markup
+      });
+    }
+
+    return sendMessage({
+      chat_id: adminChatId,
+      text: `✅ 垃圾话题 ID 已设置：<code>${topicId}</code>\n\n请在菜单中开启垃圾话题功能`
+    });
+  }
+
+  // 【修复】检查是否以 / 开头但不是有效命令
+  // 如果是无效命令且是回复消息，防止转发给用户
+  const validCommands = ['/help', '/menu', '/welcome', '/autoreply', '/ban', '/unban', '/reset', '/trust', '/untrust', '/broadcast', '/bcancel'];
+  const isValidCommand = validCommands.some(cmd => text === cmd || text.startsWith(cmd + ' '));
+  const isCommandLike = text.startsWith('/') && text.length > 1;
+
+  // 【话题模式】如果在话题中发送命令，只在话题内回复，不转发
+  if (isInTopic && isCommandLike) {
+    Logger.info('admin_command_in_topic', { text, threadId: message.message_thread_id });
+  }
 
   // --- 管理指令区域 ---
 
@@ -2797,23 +4871,32 @@ async function handleAdminMessage(message) {
   if (text === '/help') {
     const verifyMode = await getVerifyMode();
     const spamFilterEnabled = await getSpamFilterEnabled();
+    const replyTarget = getReplyTarget();
     return sendMessage({
-      chat_id: ADMIN_UID,
+      ...replyTarget,
       text: '🤖 <b>SafeRelay 管理面板</b>\n\n' +
         '<b>常用指令：</b>\n' +
         '/menu - 打开图形菜单\n' +
         '/help - 显示帮助\n' +
         '/broadcast - 广播消息\n' +
-        '/bcancel - 取消广播\n\n' +
+        '/bcancel - 取消广播\n' +
+        '/cleanup - 清理失效话题\n' +
+        '/cachestats - 查看缓存统计\n' +
+        '/clearcache - 清空所有缓存\n\n' +
         '<b>用户管理（回复消息或指定ID）：</b>\n' +
         '/ban - 封禁用户\n' +
         '/unban - 解封用户\n' +
-        '/unverify - 取消验证\n' +
+        '/reset - 重置验证\n' +
         '/trust - 信任用户(白名单)\n' +
         '/untrust - 取消信任\n\n' +
         '<b>消息设置：</b>\n' +
         '/welcome - 欢迎消息\n' +
         '/autoreply - 自动回复\n\n' +
+        '<b>转发 / 系统：</b>\n' +
+        '/cleanup - 清理失效话题\n' +
+        '/cachestats - 查看缓存统计\n' +
+        '/clearcache - 清空缓存\n' +
+        '在 /menu → 转发模式 中切换私聊/话题\n\n' +
         '<b>快捷操作：</b> 回复用户消息即可转发\n\n' +
         '<i>验证: ' + getVerifyModeName(verifyMode) + ' | 过滤: ' + (spamFilterEnabled ? '开' : '关') + '</i>',
       parse_mode: 'HTML'
@@ -2825,8 +4908,9 @@ async function handleAdminMessage(message) {
   // 指令：/menu - 显示管理菜单
   if (text === '/menu') {
     const menu = await generateMainMenu();
+    const replyTarget = getReplyTarget();
     return sendMessage({
-      chat_id: ADMIN_UID,
+      ...replyTarget,
       text: menu.text,
       parse_mode: 'HTML',
       reply_markup: menu.reply_markup
@@ -2836,16 +4920,17 @@ async function handleAdminMessage(message) {
   // 指令：/welcome - 设置欢迎消息
   if (text.startsWith('/welcome')) {
     const content = text.slice(8).trim();
+    const replyTarget = getReplyTarget();
     if (!content || content === 'delete') {
       await setConfig(CONFIG_KEYS.WELCOME_MSG, '');
       return sendMessage({
-        chat_id: ADMIN_UID,
+        ...replyTarget,
         text: '✅ 欢迎消息已删除（恢复默认）。'
       });
     }
     await setConfig(CONFIG_KEYS.WELCOME_MSG, content);
     return sendMessage({
-      chat_id: ADMIN_UID,
+      ...replyTarget,
       text: '✅ 欢迎消息已设置。'
     });
   }
@@ -2853,64 +4938,163 @@ async function handleAdminMessage(message) {
   // 指令：/autoreply - 设置自动回复
   if (text.startsWith('/autoreply')) {
     const content = text.slice(10).trim();
+    const replyTarget = getReplyTarget();
     if (!content || content === 'off') {
       await setConfig(CONFIG_KEYS.AUTO_REPLY_MSG, '');
       return sendMessage({
-        chat_id: ADMIN_UID,
+        ...replyTarget,
         text: '✅ 自动回复已关闭。'
       });
     }
     await setConfig(CONFIG_KEYS.AUTO_REPLY_MSG, content);
     return sendMessage({
-      chat_id: ADMIN_UID,
+      ...replyTarget,
       text: '✅ 自动回复已设置。'
     });
+  }
+
+  // 关键词管理 - 添加放行词
+  if (text.startsWith('allow:')) {
+    const keyword = text.slice(6).trim();
+    const replyTarget = getReplyTarget();
+    if (keyword) {
+      const rules = await getSpamFilterRules();
+      if (!rules.allowKeywords) rules.allowKeywords = [];
+      if (!rules.allowKeywords.includes(keyword)) {
+        rules.allowKeywords.push(keyword);
+        await setSpamFilterRules(rules);
+        return sendMessage({ ...replyTarget, text: `✅ 已添加放行关键词：<code>${escapeHtml(keyword)}</code>`, parse_mode: 'HTML' });
+      }
+      return sendMessage({ ...replyTarget, text: '⚠️ 该放行关键词已存在。' });
+    }
+  }
+
+  // 关键词管理 - 添加正则
+  if (text.startsWith('regex:')) {
+    const regex = text.slice(6).trim();
+    if (regex) {
+      const rules = await getSpamFilterRules();
+      if (!rules.regexes) rules.regexes = [];
+      try {
+        new RegExp(regex, 'i'); // 验证正则有效性
+        rules.regexes.push(regex);
+        await setSpamFilterRules(rules);
+        return sendMessage({ chat_id: adminChatId, text: `✅ 已添加正则规则：<code>${escapeHtml(regex)}</code>`, parse_mode: 'HTML' });
+      } catch (e) {
+        return sendMessage({ chat_id: adminChatId, text: '❌ 正则表达式无效。' });
+      }
+    }
+  }
+
+  // 关键词管理 - 删除拦截词
+  if (text.startsWith('del:')) {
+    const keyword = text.slice(4).trim();
+    if (keyword) {
+      const rules = await getSpamFilterRules();
+      const index = (rules.keywords || []).indexOf(keyword);
+      if (index > -1) {
+        rules.keywords.splice(index, 1);
+        await setSpamFilterRules(rules);
+        return sendMessage({ chat_id: adminChatId, text: `✅ 已删除拦截关键词：<code>${escapeHtml(keyword)}</code>`, parse_mode: 'HTML' });
+      }
+      return sendMessage({ chat_id: adminChatId, text: '⚠️ 未找到该拦截关键词。' });
+    }
+  }
+
+  // 关键词管理 - 删除放行词
+  if (text.startsWith('delallow:')) {
+    const keyword = text.slice(9).trim();
+    if (keyword) {
+      const rules = await getSpamFilterRules();
+      const index = (rules.allowKeywords || []).indexOf(keyword);
+      if (index > -1) {
+        rules.allowKeywords.splice(index, 1);
+        await setSpamFilterRules(rules);
+        return sendMessage({ chat_id: adminChatId, text: `✅ 已删除放行关键词：<code>${escapeHtml(keyword)}</code>`, parse_mode: 'HTML' });
+      }
+      return sendMessage({ chat_id: adminChatId, text: '⚠️ 未找到该放行关键词。' });
+    }
+  }
+
+  // 关键词管理 - 清空默认规则
+  if (text === '清空默认') {
+    await resetSpamFilterRules();
+    return sendMessage({ chat_id: adminChatId, text: '✅ 已重置为默认规则。' });
+  }
+
+  // 链接数量设置
+  if (text.startsWith('max_links:')) {
+    const num = parseInt(text.slice(10));
+    if (!isNaN(num) && num >= 0) {
+      const rules = await getSpamFilterRules();
+      rules.maxLinks = num;
+      await setSpamFilterRules(rules);
+      return sendMessage({ chat_id: adminChatId, text: `✅ 链接限制已设置为：${num}` });
+    }
+    return sendMessage({ chat_id: adminChatId, text: '⚠️ 请输入有效的数字。' });
+  }
+
+  // 普通文本 - 添加为拦截关键词（如果不是命令）
+  if (!reply && text && !text.startsWith('/') && text.length > 0) {
+    // 检查是否在关键词管理上下文中
+    const rules = await getSpamFilterRules();
+    if (!rules.keywords) rules.keywords = [];
+
+    // 避免重复添加
+    if (!rules.keywords.includes(text)) {
+      rules.keywords.push(text);
+      await setSpamFilterRules(rules);
+      return sendMessage({ chat_id: adminChatId, text: `✅ 已添加拦截关键词：<code>${escapeHtml(text)}</code>\n发送 del:${escapeHtml(text)} 删除`, parse_mode: 'HTML' });
+    }
   }
 
   // 指令：/ban [ID] (支持回复或手输)
   if (text === '/ban' || text.startsWith('/ban ')) {
     const targetId = await getTargetId(message, '/ban');
+    const replyTarget = getReplyTarget();
     if (targetId) {
       await KV.put('blocked-' + targetId, 'true'); // 永久拉黑
       memDelete('blocked-' + targetId); // 清除缓存
       await removeVerifiedUser(targetId); // 从已验证列表移除
-      return sendMessage({ chat_id: ADMIN_UID, text: `🚫 用户 ${targetId} 已被封禁。` });
+      return sendMessage({ ...replyTarget, text: `🚫 用户 <code>${targetId}</code> 已被封禁。` });
     } else {
-      return sendMessage({ chat_id: ADMIN_UID, text: '⚠️ 格式错误。\n请回复用户消息发送 /ban\n或发送 /ban 123456 (必须是数字 ID)' });
+      return sendMessage({ ...replyTarget, text: '⚠️ 格式错误。\n请回复用户消息发送 /ban\n或发送 /ban 123456 (必须是数字 ID)' });
     }
   }
 
   // 指令：/unban [ID] (支持回复或手输)
   if (text === '/unban' || text.startsWith('/unban ')) {
     const targetId = await getTargetId(message, '/unban');
+    const replyTarget = getReplyTarget();
     if (targetId) {
       await KV.delete('blocked-' + targetId);
       memDelete('blocked-' + targetId); // 清除缓存
-      return sendMessage({ chat_id: ADMIN_UID, text: `✅ 用户 ${targetId} 已解封。` });
+      return sendMessage({ ...replyTarget, text: `✅ 用户 <code>${targetId}</code> 已解封。` });
     } else {
-      return sendMessage({ chat_id: ADMIN_UID, text: '⚠️ 格式错误。\n请回复用户消息发送 /unban\n或发送 /unban 123456 (必须是数字 ID)' });
+      return sendMessage({ ...replyTarget, text: '⚠️ 格式错误。\n请回复用户消息发送 /unban\n或发送 /unban 123456 (必须是数字 ID)' });
     }
   }
 
-  // 指令：/unverify [ID] (支持回复或手输)
-  if (text === '/unverify' || text.startsWith('/unverify ')) {
-    const targetId = await getTargetId(message, '/unverify');
+  // 指令：/reset [ID] (支持回复或手输)
+  if (text === '/reset' || text.startsWith('/reset ')) {
+    const targetId = await getTargetId(message, '/reset');
+    const replyTarget = getReplyTarget();
     if (targetId) {
       // 检查用户是否在白名单中
       const isWhite = await isWhitelisted(targetId);
       if (isWhite) {
         return sendMessage({
-          chat_id: ADMIN_UID,
-          text: `⚠️ 用户 ${targetId} 在白名单中，无需验证即可发送消息。\n\n如需限制该用户，请先使用 /delwhite ${targetId} 删除白名单。`
+          ...replyTarget,
+          text: `⚠️ 用户 <code>${targetId}</code> 在白名单中，无需验证即可发送消息。\n\n如需限制该用户，请先使用 /delwhite <code>${targetId}</code> 删除白名单。`
         });
       }
 
       await KV.delete('verified-' + targetId);
       memDelete('verified-' + targetId); // 清除缓存
       await removeVerifiedUser(targetId); // 从已验证列表移除
-      return sendMessage({ chat_id: ADMIN_UID, text: `🔄 用户 ${targetId} 验证状态已取消。` });
+      return sendMessage({ ...replyTarget, text: `🔄 用户 <code>${targetId}</code> 验证状态已取消。` });
     } else {
-      return sendMessage({ chat_id: ADMIN_UID, text: '⚠️ 格式错误。\n请回复用户消息发送 /unverify\n或发送 /unverify 123456 (必须是数字 ID)' });
+      return sendMessage({ ...replyTarget, text: '⚠️ 格式错误。\n请回复用户消息发送 /reset\n或发送 /reset 123456 (必须是数字 ID)' });
     }
   }
 
@@ -2919,32 +5103,42 @@ async function handleAdminMessage(message) {
     const broadcastMsg = text === '/broadcast' ? '' : text.slice(10).trim();
     if (!broadcastMsg) {
       return sendMessage({
-        chat_id: ADMIN_UID,
+        chat_id: adminChatId,
         text: '⚠️ 格式错误。\n用法：/broadcast 消息内容\n\n支持 HTML 格式：\n<b>粗体</b> <i>斜体</i> <code>代码</code>'
       });
     }
 
-    // 检查24小时冷却
-    const lastBroadcast = await KV.get(`broadcast_cooldown:${ADMIN_UID}`);
+    // 检查 24 小时冷却（使用增强的限流）
+    const rateLimit = checkRateLimit(adminChatId, 'broadcast');
+    if (!rateLimit.allowed) {
+      const remainingHours = Math.ceil(rateLimit.retryAfter / 3600);
+      return sendMessage({
+        chat_id: adminChatId,
+        text: `⏳ 广播冷却中，请 ${remainingHours} 小时后再试。\n\n限额：${rateLimit.limit} 次/24 小时`
+      });
+    }
+
+    // 记录限流
+    const lastBroadcast = await KV.get(`broadcast_cooldown:${adminChatId}`);
     if (lastBroadcast) {
       const lastTime = parseInt(lastBroadcast);
       const now = Date.now();
-      const cooldownMs = 24 * 60 * 60 * 1000; // 24小时
+      const cooldownMs = 24 * 60 * 60 * 1000; // 24 小时
       const remainingMs = cooldownMs - (now - lastTime);
 
       if (remainingMs > 0) {
         const remainingHours = Math.ceil(remainingMs / (60 * 60 * 1000));
         return sendMessage({
-          chat_id: ADMIN_UID,
+          chat_id: adminChatId,
           text: `⏳ 广播冷却中，请 ${remainingHours} 小时后再试。`
         });
       }
     }
 
     // 保存消息到 KV（24小时过期）
-    await KV.put(`broadcast_msg:${ADMIN_UID}`, broadcastMsg, { expirationTtl: 86400 });
+    await KV.put(`broadcast_msg:${adminChatId}`, broadcastMsg, { expirationTtl: 86400 });
     // 记录广播时间
-    await KV.put(`broadcast_cooldown:${ADMIN_UID}`, Date.now().toString(), { expirationTtl: 86400 });
+    await KV.put(`broadcast_cooldown:${adminChatId}`, Date.now().toString(), { expirationTtl: 86400 });
 
     // 发送第一批（500人）
     const result = await sendBroadcastBatch(broadcastMsg, 0, 500);
@@ -2959,7 +5153,7 @@ async function handleAdminMessage(message) {
     inlineKeyboard.push([{ text: '❌ 取消广播', callback_data: 'bcancel' }]);
 
     return sendMessage({
-      chat_id: ADMIN_UID,
+      chat_id: adminChatId,
       text: `${statusIcon} <b>广播${statusText}</b>\n\n✅ 已发送：${result.sent}/${result.total}\n❌ 失败：${result.failed}${result.skipped > 0 ? `\n⏭️ 跳过（封禁）：${result.skipped}` : ''}`,
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: inlineKeyboard }
@@ -2969,51 +5163,118 @@ async function handleAdminMessage(message) {
   // 指令：/trust [ID] - 添加白名单（信任用户）
   if (text === '/trust' || text.startsWith('/trust ')) {
     const targetId = await getTargetId(message, '/trust');
+    const replyTarget = getReplyTarget();
     if (targetId) {
       await addToWhitelist(targetId);
-      return sendMessage({ chat_id: ADMIN_UID, text: `✅ 已信任用户 ${targetId}` });
+      return sendMessage({ ...replyTarget, text: `✅ 已信任用户 <code>${targetId}</code>` });
     } else {
-      // 如果没有指定ID，显示当前白名单状态
-      return sendMessage({ chat_id: ADMIN_UID, text: '📋 请回复用户消息或发送 /trust 123456 来信任用户' });
+      // 如果没有指定 ID，显示当前白名单状态
+      return sendMessage({ ...replyTarget, text: '📋 请回复用户消息或发送 /trust 123456 来信任用户' });
     }
   }
 
   // 指令：/untrust [ID] - 删除白名单（取消信任）
   if (text === '/untrust' || text.startsWith('/untrust ')) {
     const targetId = await getTargetId(message, '/untrust');
+    const replyTarget = getReplyTarget();
     if (targetId) {
       await removeFromWhitelist(targetId);
-      return sendMessage({ chat_id: ADMIN_UID, text: `✅ 已取消信任用户 ${targetId}` });
+      return sendMessage({ ...replyTarget, text: `✅ 已取消信任用户 <code>${targetId}</code>` });
     } else {
-      return sendMessage({ chat_id: ADMIN_UID, text: '📋 请回复用户消息或发送 /untrust 123456 来取消信任' });
+      return sendMessage({ ...replyTarget, text: '📋 请回复用户消息或发送 /untrust 123456 来取消信任' });
     }
   }
 
   // 指令：/bcancel - 取消广播（保留命令方式作为备选）
   if (text === '/bcancel') {
-    await KV.delete(`broadcast_msg:${ADMIN_UID}`);
+    await KV.delete(`broadcast_msg:${adminChatId}`);
     return sendMessage({
-      chat_id: ADMIN_UID,
+      chat_id: adminChatId,
       text: '✅ 已取消广播'
+    });
+  }
+
+  // 指令：/cleanup - 批量清理失效的话题映射
+  if (text === '/cleanup' || text.startsWith('/cleanup ')) {
+    const args = text.split(/\s+/);
+    const dryRun = args.includes('--dry-run') || args.includes('-n');
+    const cleanAll = args.includes('--all') || args.includes('-a');
+
+    return handleCleanupCommand(message, { dryRun, cleanAll }, adminChatId);
+  }
+
+  // 指令：/cachestats - 查看缓存统计
+  if (text === '/cachestats') {
+    const stats = getCacheStats();
+    const text = `📊 <b>缓存统计信息</b>\n\n` +
+      `<b>L1 内存缓存：</b>\n` +
+      `  命中：${stats.l1.hits}\n` +
+      `  未命中：${stats.l1.misses}\n` +
+      `  命中率：${stats.l1.hitRate}\n` +
+      `  缓存大小：${stats.l1.size} 条目\n\n` +
+      `<b>L2 KV 缓存：</b>\n` +
+      `  命中：${stats.l2.hits}\n` +
+      `  未命中：${stats.l2.misses}\n` +
+      `  命中率：${stats.l2.hitRate}\n\n` +
+      `<i>提示：命中率越高，性能越好</i>`;
+
+    return sendMessage({
+      chat_id: adminChatId,
+      text: text,
+      parse_mode: 'HTML'
+    });
+  }
+
+  // 指令：/clearcache - 清空所有缓存
+  if (text === '/clearcache') {
+    clearAllCache();
+    return sendMessage({
+      chat_id: adminChatId,
+      text: '✅ 已清空所有缓存\n\nL1 内存缓存和统计信息已重置。\nL2 KV 缓存将在到期后自动清理。',
+      parse_mode: 'HTML'
     });
   }
 
   // --- 普通回复逻辑 ---
 
+  // 【话题模式】在话题中发送命令时，不转发到私聊
+  if (isInTopic && isCommandLike) {
+    // 如果是有效命令，已经在上面处理了
+    // 如果是无效命令，提示用户
+    if (!isValidCommand) {
+      return sendMessage({
+        chat_id: contextChatId,
+        text: `⚠️ 无效命令 "${text.split(' ')[0]}"\n\n请发送 /help 查看所有可用指令。`,
+        parse_mode: 'HTML',
+        message_thread_id: message.message_thread_id
+      });
+    }
+    // 有效命令已处理，这里不会执行到
+    return;
+  }
+
   // 检查是否在回复转发消息或编辑提示消息
   if (reply) {
     let guestChatId = null;
 
-    // 情况1：回复转发消息
-    if (reply.forward_from || reply.forward_sender_name) {
+    // 【话题模式支持】从话题 ID 查找用户
+    const isTopicMode = await isTopicForwardingEnabled();
+    if (isTopicMode && reply.message_thread_id && contextChatId === GROUP_ID) {
+      const threadId = reply.message_thread_id;
+      guestChatId = await KV.get(`thread:${threadId}`);
+      Logger.info('admin_reply_in_topic_mode', { adminChatId, threadId, guestChatId });
+    }
+
+    // 情况 1：回复转发消息
+    if (!guestChatId && (reply.forward_from || reply.forward_sender_name)) {
       guestChatId = await KV.get('msg-map-' + reply.message_id);
     }
-    // 情况2：回复编辑提示消息（以 ✏️ 开头）
-    else if (reply.text && reply.text.startsWith('✏️')) {
+    // 情况 2：回复编辑提示消息（以 ✏️ 开头）
+    if (!guestChatId && reply.text && reply.text.startsWith('✏️')) {
       guestChatId = await KV.get('msg-map-' + reply.message_id);
     }
-    // 情况3：回复垃圾过滤菜单消息
-    else if (reply.text && reply.text.includes('🗑 <b>垃圾消息过滤设置</b>')) {
+    // 情况 3：回复垃圾过滤菜单消息
+    if (!guestChatId && reply.text && reply.text.includes('🗑 <b>垃圾消息过滤设置</b>')) {
       // 解析编辑内容
       const newRules = parseSpamRulesEdit(text);
       await setSpamFilterRules(newRules);
@@ -3021,7 +5282,7 @@ async function handleAdminMessage(message) {
       // 刷新菜单
       const menu = await generateSpamFilterSubmenu();
       await requestTelegram('editMessageText', {
-        chat_id: ADMIN_UID,
+        chat_id: replyChatId || contextChatId || adminChatId,
         message_id: reply.message_id,
         text: menu.text,
         parse_mode: 'HTML',
@@ -3029,8 +5290,21 @@ async function handleAdminMessage(message) {
       });
 
       return sendMessage({
-        chat_id: ADMIN_UID,
+        chat_id: adminChatId,
         text: '✅ 垃圾过滤规则已更新'
+      });
+    }
+
+    if (!guestChatId) {
+      guestChatId = await KV.get('msg-map-' + reply.message_id);
+    }
+
+    // 【修复】检查是否是回复消息但发送了无效命令
+    if (isCommandLike && !isValidCommand) {
+      return sendMessage({
+        chat_id: adminChatId,
+        text: `⚠️ 无效命令 "${text.split(' ')[0]}"\n\n请检查命令拼写，或发送 /help 查看所有可用指令。`,
+        parse_mode: 'HTML'
       });
     }
 
@@ -3052,15 +5326,180 @@ async function handleAdminMessage(message) {
       return copyReq;
     } else {
       return sendMessage({
-        chat_id: ADMIN_UID,
+        chat_id: adminChatId,
         text: '⚠️ 未找到原用户映射，可能消息太旧或被清理了缓存。'
       });
     }
   } else {
     // 既不是指令也不是回复，提示使用 /help
     return sendMessage({
-      chat_id: ADMIN_UID,
+      chat_id: adminChatId,
       text: '🤖 请发送 /help 查看所有可用指令，或直接回复用户消息进行转发。',
+      parse_mode: 'HTML'
+    });
+  }
+}
+
+// 批量清理失效的话题映射
+async function handleCleanupCommand(message, options = {}, overrideChatId = null) {
+  const { dryRun = false, cleanAll = false } = options;
+  const adminChatId = overrideChatId || (message.chat?.id ? String(message.chat.id) : ADMIN_UID);
+  const groupId = getEnv('GROUP_ID');
+
+  if (!groupId) {
+    return sendMessage({
+      chat_id: adminChatId,
+      text: '⚠️ 未配置 GROUP_ID 环境变量\n\n话题清理功能仅在使用论坛群组时需要。\n请在 Cloudflare 环境变量中设置 GROUP_ID。'
+    });
+  }
+
+  // 发送开始通知
+  const startMsg = dryRun ? '🔍 <b>开始扫描失效话题（预览模式）</b>' : '🧹 <b>开始清理失效话题</b>';
+  const progressMsg = await sendMessage({
+    chat_id: adminChatId,
+    text: `${startMsg}\n\n正在扫描用户数据...`,
+    parse_mode: 'HTML'
+  });
+
+  try {
+    // 获取所有用户数据
+    const userKeys = [];
+    let cursor = undefined;
+
+    // 分批读取所有 user:* 键
+    while (true) {
+      const listOptions = {
+        prefix: 'user:',
+        limit: 1000
+      };
+      if (cursor) {
+        listOptions.cursor = cursor;
+      }
+
+      const result = await KV.list(listOptions);
+      for (const key of result.keys) {
+        userKeys.push(key.name);
+      }
+
+      if (result.list_complete) {
+        break;
+      }
+      cursor = result.cursor;
+    }
+
+    Logger.info('cleanup_scan_started', { totalKeys: userKeys.length });
+
+    let invalidCount = 0;
+    let cleanedCount = 0;
+    let errorCount = 0;
+    const invalidUsers = [];
+
+    // 检查每个用户的话题
+    for (let i = 0; i < userKeys.length; i++) {
+      const key = userKeys[i];
+      const userId = key.replace('user:', '');
+
+      try {
+        const userData = await safeGetJSON(key, null);
+        if (!userData || !userData.thread_id) {
+          continue; // 没有话题 ID，跳过
+        }
+
+        const threadId = userData.thread_id;
+
+        // 检查话题是否有效
+        const isValid = await validateForumThread(groupId, threadId);
+
+        if (!isValid) {
+          invalidCount++;
+          invalidUsers.push({ userId, threadId });
+
+          if (!dryRun) {
+            // 删除失效的映射
+            await safeKvDelete(key); // user:{userId}
+            await safeKvDelete(`thread:${threadId}`); // thread:{threadId}
+            await safeKvDelete(`verified-${userId}`); // verified-{userId}
+
+            // 清理缓存
+            memDelete(key);
+            memDelete(`thread:${threadId}`);
+            memDelete(`verified-${userId}`);
+            threadHealthCache.delete(`thread:${threadId}`);
+
+            cleanedCount++;
+          }
+        }
+
+        // 每 100 个用户更新一次进度
+        if ((i + 1) % 100 === 0) {
+          await requestTelegram('editMessageText', {
+            chat_id: adminChatId,
+            message_id: progressMsg.result.message_id,
+            text: `${startMsg}\n\n进度：${i + 1}/${userKeys.length}\n已发现失效：${invalidCount}${!dryRun ? `\n已清理：${cleanedCount}` : ''}`,
+            parse_mode: 'HTML'
+          });
+        }
+
+        // 避免触发速率限制
+        if ((i + 1) % 50 === 0) {
+          await new Promise(r => setTimeout(r, 100));
+        }
+
+      } catch (e) {
+        errorCount++;
+        Logger.error('cleanup_check_user_failed', e, { userId, key });
+      }
+    }
+
+    // 更新最终结果
+    const resultText = [
+      `✅ <b>清理完成</b>`,
+      ``,
+      `📊 <b>统计信息：</b>`,
+      `• 总用户数：${userKeys.length}`,
+      `• 失效话题：${invalidCount}`,
+      !dryRun ? `• 已清理：${cleanedCount}` : `• 预览模式：未执行清理`,
+      errorCount > 0 ? `• 错误：${errorCount}` : null
+    ].filter(Boolean).join('\n');
+
+    if (invalidCount > 0 && !dryRun) {
+      // 附加详细信息（最多显示 20 个）
+      const detailLimit = Math.min(20, invalidUsers.length);
+      const details = invalidUsers.slice(0, detailLimit)
+        .map(u => `• User ${u.userId}: Topic ${u.threadId}`)
+        .join('\n');
+
+      const moreText = invalidUsers.length > detailLimit ? `\n... 还有 ${invalidUsers.length - detailLimit} 个` : '';
+
+      await requestTelegram('editMessageText', {
+        chat_id: adminChatId,
+        message_id: progressMsg.result.message_id,
+        text: `${resultText}\n\n<b>失效用户列表：</b>\n${details}${moreText}`,
+        parse_mode: 'HTML'
+      });
+    } else {
+      await requestTelegram('editMessageText', {
+        chat_id: adminChatId,
+        message_id: progressMsg.result.message_id,
+        text: resultText,
+        parse_mode: 'HTML'
+      });
+    }
+
+    Logger.info('cleanup_completed', {
+      total: userKeys.length,
+      invalid: invalidCount,
+      cleaned: cleanedCount,
+      errors: errorCount,
+      dryRun
+    });
+
+  } catch (e) {
+    Logger.error('cleanup_failed', e);
+    await requestTelegram('editMessageText', {
+      chat_id: adminChatId,
+      message_id: progressMsg.result.message_id,
+      text: `❌ <b>清理失败</b>\n\n错误信息：${e.message}\n\n请检查日志或重试。`,
       parse_mode: 'HTML'
     });
   }
@@ -3122,7 +5561,21 @@ async function handleVerification(message, chatId, origin) {
   }
 
   // Turnstile 验证或双重验证
-  const verifyUrl = `${origin}/verify?uid=${chatId}`;
+  let session;
+  try {
+    session = await createTurnstileSession(chatId);
+  } catch (e) {
+    Logger.error('turnstile_session_create_failed', e, { userId: chatId });
+  }
+
+  if (!session) {
+    return sendMessage({
+      chat_id: chatId,
+      text: '⚠️ 系统暂时无法创建验证会话，请稍后再试。'
+    });
+  }
+
+  const verifyUrl = `${origin}/verify?session=${encodeURIComponent(session.sessionId)}&sig=${encodeURIComponent(session.signature)}`;
 
   // 获取自定义欢迎消息
   const welcomeMsg = await getConfig(CONFIG_KEYS.WELCOME_MSG);
@@ -3151,6 +5604,25 @@ async function handleVerification(message, chatId, origin) {
 
 // 渲染验证页面
 function handleVerifyPage(request) {
+  const siteKey = getTurnstileSiteKey();
+  const url = new URL(request.url);
+  const sessionId = url.searchParams.get('session');
+  const sessionSignature = url.searchParams.get('sig');
+
+  if (!siteKey) {
+    return new Response('Turnstile 未配置', {
+      status: 503,
+      headers: { 'content-type': 'text/plain;charset=UTF-8' }
+    });
+  }
+
+  if (!sessionId || !sessionSignature) {
+    return new Response('Invalid verification session', {
+      status: 400,
+      headers: { 'content-type': 'text/plain;charset=UTF-8' }
+    });
+  }
+
   // 中文语言配置
   const t = {
     title: '人机验证 - SafeRelay',
@@ -3322,7 +5794,7 @@ function handleVerifyPage(request) {
               
               <!-- Turnstile 验证区域 -->
               <div id="verify-section" class="turnstile-container mb-6">
-                  <div id="turnstile-widget" class="cf-turnstile" data-sitekey="${CF_TURNSTILE_SITE_KEY}" data-callback="onVerify" data-theme="auto"></div>
+                  <div id="turnstile-widget" class="cf-turnstile" data-sitekey="${siteKey}" data-callback="onVerify" data-theme="auto"></div>
               </div>
               
               <!-- 加载状态 -->
@@ -3436,9 +5908,10 @@ function handleVerifyPage(request) {
 
           function onVerify(token) {
               const urlParams = new URLSearchParams(window.location.search);
-              const uid = urlParams.get('uid');
+              const session = urlParams.get('session');
+              const signature = urlParams.get('sig');
               
-              if (!uid) {
+              if (!session || !signature) {
                   showError();
                   return;
               }
@@ -3466,7 +5939,7 @@ function handleVerifyPage(request) {
               fetch('/verify-callback', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ token, uid, userInfo })
+                  body: JSON.stringify({ token, session, signature, userInfo })
               })
               .then(response => {
                   if (response.ok) {
@@ -3515,90 +5988,109 @@ async function handleVerifyCallback(request) {
   }
 
   try {
-    const { token, uid, userInfo } = await request.json();
+    const { token, session, signature, userInfo } = await request.json();
 
-    if (!token || !uid) {
-      return new Response('Missing token or uid', { status: 400 });
+    if (!token || !session || !signature) {
+      return new Response('Missing token or session', { status: 400 });
     }
 
-    // 向 Cloudflare 验证 Token
+    const sessionInfo = await validateTurnstileSession(session, signature);
+    if (!sessionInfo.valid) {
+      return new Response('Invalid verification session', { status: 400 });
+    }
+
+    const uid = sessionInfo.userId;
+    const secretKey = getTurnstileSecretKey();
+    if (!secretKey) {
+      return new Response('Turnstile not configured', { status: 503 });
+    }
+
     const formData = new FormData();
-    formData.append('secret', CF_TURNSTILE_SECRET_KEY);
+    formData.append('secret', secretKey);
     formData.append('response', token);
-    // formData.append('remoteip', request.headers.get('CF-Connecting-IP')); // 可选
 
     const result = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
       method: 'POST',
       body: formData
     }).then(r => r.json());
 
-    if (result.success) {
-      // 验证通过！写入 KV
-      const verifiedKey = 'verified-' + String(uid);
-      await KV.put(verifiedKey, 'true', { expirationTtl: VERIFICATION_TTL });
-      memSet(verifiedKey, 'true', 5 * 60 * 1000); // 更新缓存
+    if (!result.success) {
+      Logger.warn('turnstile_verification_failed', { userId: uid, errors: result['error-codes'] });
+      return new Response('Verification failed', { status: 400 });
+    }
 
-      // 构建用户显示名称
-      let displayName = 'Unknown';
-      if (userInfo) {
-        if (userInfo.first_name || userInfo.last_name) {
-          displayName = `${userInfo.first_name || ''} ${userInfo.last_name || ''}`.trim();
-        } else if (userInfo.username) {
-          displayName = `@${userInfo.username}`;
-        }
+    const allowedHostnames = getTurnstileAllowedHostnames();
+    if (allowedHostnames.length && (!result.hostname || !allowedHostnames.includes(result.hostname))) {
+      Logger.warn('turnstile_hostname_mismatch', { userId: uid, hostname: result.hostname });
+      return new Response('Hostname mismatch', { status: 400 });
+    }
+
+    const expectedAction = getTurnstileExpectedAction();
+    if (expectedAction && result.action && result.action !== expectedAction) {
+      Logger.warn('turnstile_action_mismatch', { userId: uid, action: result.action, expected: expectedAction });
+      return new Response('Action mismatch', { status: 400 });
+    }
+
+    await consumeTurnstileSession(session);
+
+    const verifiedKey = 'verified-' + String(uid);
+    await KV.put(verifiedKey, 'true', { expirationTtl: VERIFICATION_TTL });
+    memSet(verifiedKey, 'true', 5 * 60 * 1000);
+
+    let displayName = 'Unknown';
+    if (userInfo) {
+      if (userInfo.first_name || userInfo.last_name) {
+        displayName = `${userInfo.first_name || ''} ${userInfo.last_name || ''}`.trim();
+      } else if (userInfo.username) {
+        displayName = `@${userInfo.username}`;
       }
+    }
 
-      // 添加到已验证用户列表
-      await addVerifiedUser(uid, displayName);
+    await addVerifiedUser(uid, displayName);
 
-      // 缓存用户资料
-      if (userInfo) {
-        await upsertUserProfileFromUpdate(userInfo);
-      }
+    if (userInfo) {
+      await upsertUserProfileFromUpdate(userInfo);
+    }
 
-      // 处理暂存的消息
-      const pendingResult = await processPendingMessagesAfterVerification(uid);
-      Logger.info('turnstile_verification_success', { userId: uid, pendingForwarded: pendingResult.forwarded });
+    const pendingResult = await processPendingMessagesAfterVerification(uid);
+    Logger.info('turnstile_verification_success', { userId: uid, pendingForwarded: pendingResult.forwarded });
 
-      // 主动通知用户验证成功
-      let successMsg = '✅ 验证通过！\n\n如果重复验证请等待一分钟后再发送消息，以确保验证状态同步。';
-      if (pendingResult.forwarded > 0) {
-        successMsg = `✅ 验证通过！\n\n📩 刚才的 ${pendingResult.forwarded} 条消息已送达管理员。`;
-      }
-      await sendMessage({
-        chat_id: uid,
-        text: successMsg
-      });
+    let successMsg = `✅ 验证通过！
 
-      // 通知管理员有新用户验证
-      let usernameLine = '';
-      if (userInfo && userInfo.username) {
-        usernameLine = `\n📎 @${escapeHtml(userInfo.username)}`;
-      }
-      await requestTelegram('sendMessage', {
-        chat_id: ADMIN_UID,
-        text: `✅ <b>新用户验证通过</b>
+如果重复验证请等待一分钟后再发送消息，以确保验证状态同步。`;
+    if (pendingResult.forwarded > 0) {
+      successMsg = `✅ 验证通过！
+
+📩 刚才的 ${pendingResult.forwarded} 条消息已送达管理员。`;
+    }
+    await sendMessage({
+      chat_id: uid,
+      text: successMsg
+    });
+
+    let usernameLine = '';
+    if (userInfo && userInfo.username) {
+      usernameLine = `
+📎 @${escapeHtml(userInfo.username)}`;
+    }
+    await requestTelegram('sendMessage', {
+      chat_id: ADMIN_UID,
+      text: `✅ <b>新用户验证通过</b>
 
 🆔 <code>${uid}</code> (${escapeHtml(displayName)})${usernameLine}`,
-        parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
-        reply_markup: {
-          inline_keyboard: [[
-            { text: '👤 打开用户资料', url: `tg://user?id=${uid}` }
-          ]]
-        }
-      });
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '👤 打开用户资料', url: `tg://user?id=${uid}` }
+        ]]
+      }
+    });
 
-      return new Response(JSON.stringify({ success: true }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' }
-      });
-    } else {
-      return new Response(JSON.stringify({ success: false, error: result['error-codes'] }), {
-        status: 400,
-        headers: { 'content-type': 'application/json' }
-      });
-    }
+    return new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    });
   } catch (e) {
     return new Response(e.message, { status: 500 });
   }
@@ -3612,80 +6104,294 @@ async function getVerificationTtl() {
 
 // 处理访客消息 (已验证)
 async function handleGuestMessage(message) {
+  // 【修复】过滤 /start 命令，不转发给管理员
+  const text = (message.text || '').trim();
+  if (text === '/start') {
+    return; // 静默忽略 /start 命令
+  }
+
+  const userId = message.chat.id.toString();
+  Logger.info('handle_guest_message_start', { userId, text: text ? text.substring(0, 50) : '[media]' });
+
   // 记录统计信息
   await incrementMessageCount();
-  await recordActiveUser(message.chat.id.toString());
+  await recordActiveUser(userId);
 
+  const desiredTopicMode = await isTopicForwardingEnabled();
+  Logger.info('handle_guest_message_mode_check', { userId, desiredTopicMode, GROUP_ID, ADMIN_UID });
+
+  let topicContext = null;
+  if (desiredTopicMode) {
+    Logger.info('handle_guest_message_calling_ensure_topic', { userId });
+    topicContext = await ensureUserTopic(userId, message.from || await getUserProfile(userId));
+    Logger.info('handle_guest_message_topic_context', { userId, topicContext });
+    if (!topicContext) {
+      Logger.warn('topic_forwarding_unavailable', { userId });
+    }
+  }
+
+  Logger.info('handle_guest_message_before_media_group', { userId, hasTopicContext: !!topicContext });
   return handleMediaGroup(message, async (messages) => {
-    if (messages.length === 1) {
-      // 单条消息，使用原来的转发方式
-      const msg = messages[0];
-      const forwardReq = await forwardMessage({
-        chat_id: ADMIN_UID,
-        from_chat_id: msg.chat.id,
-        message_id: msg.message_id
-      });
-
-      if (forwardReq.ok && forwardReq.result && forwardReq.result.message_id) {
-        await KV.put('msg-map-' + forwardReq.result.message_id, msg.chat.id.toString(), { expirationTtl: 172800 });
-        await KV.put('orig-map-' + msg.message_id, forwardReq.result.message_id.toString(), { expirationTtl: 172800 });
-      } else {
-        await sendMessage({
-          chat_id: ADMIN_UID,
-          text: `❌ 转发消息失败：${JSON.stringify(forwardReq)}`
-        });
-      }
-    } else {
-      // 媒体组，批量转发
-      const firstMsg = messages[0];
-      const messageIds = messages.map(m => m.message_id);
-
-      const forwardReq = await requestTelegram('forwardMessages', {
-        chat_id: ADMIN_UID,
-        from_chat_id: firstMsg.chat.id,
-        message_ids: messageIds
-      });
-
-      if (forwardReq.ok && forwardReq.result) {
-        // 存储映射关系
-        for (let i = 0; i < messages.length; i++) {
-          const origMsg = messages[i];
-          const forwardedMsg = forwardReq.result[i];
-          if (forwardedMsg && forwardedMsg.message_id) {
-            await KV.put('msg-map-' + forwardedMsg.message_id, origMsg.chat.id.toString(), { expirationTtl: 172800 });
-            await KV.put('orig-map-' + origMsg.message_id, forwardedMsg.message_id.toString(), { expirationTtl: 172800 });
-          }
-        }
-      } else {
-        await sendMessage({
-          chat_id: ADMIN_UID,
-          text: `❌ 批量转发消息失败：${JSON.stringify(forwardReq)}`
-        });
+    Logger.info('handle_guest_message_in_media_group', { userId, messageCount: messages.length });
+    if (topicContext && topicContext.threadId) {
+      const topicResult = await forwardMessagesToTopic(messages, userId, topicContext.threadId);
+      Logger.info('handle_guest_message_topic_forward_result', { userId, ok: topicResult?.ok });
+      if (topicResult?.ok) {
+        return topicResult;
       }
     }
+    Logger.info('handle_guest_message_forwarding_to_admin', { userId });
+    return forwardMessagesToAdmin(messages, userId);
+  });
+}
+
+async function forwardMessagesToAdmin(messages, userId) {
+  if (!ADMIN_UID) {
+    Logger.error('admin_uid_missing_forward', { userId });
+    return { ok: false, errorType: 'admin_missing' };
+  }
+  return forwardMessagesToTarget(messages, userId, { chatId: ADMIN_UID, label: 'admin_dm' });
+}
+
+async function forwardMessagesToTopic(messages, userId, threadId, attempt = 1) {
+  if (!GROUP_ID) return { ok: false, errorType: 'group_missing' };
+  const target = { chatId: GROUP_ID, threadId, label: 'topic' };
+  const result = await forwardMessagesToTarget(messages, userId, target);
+  if (result.ok) {
+    return result;
+  }
+
+  if (result.errorType === 'thread_not_found' && attempt < 2) {
+    await invalidateUserTopicMapping(userId, threadId);
+    const profile = await getUserProfile(userId);
+    const newTopic = await ensureUserTopic(userId, profile);
+    if (newTopic?.threadId && newTopic.threadId !== threadId) {
+      return forwardMessagesToTopic(messages, userId, newTopic.threadId, attempt + 1);
+    }
+  }
+
+  return result;
+}
+
+async function forwardMessagesToTarget(messages, userId, target) {
+  if (!messages || messages.length === 0) {
+    return { ok: false, errorType: 'empty' };
+  }
+  if (messages.length === 1) {
+    const msg = messages[0];
+    const payload = {
+      chat_id: target.chatId,
+      from_chat_id: msg.chat.id,
+      message_id: msg.message_id
+    };
+    if (target.threadId) payload.message_thread_id = target.threadId;
+
+    const forwardReq = await forwardMessage(payload);
+    const outcome = await handleSingleForwardResult(forwardReq, msg, target, userId);
+    if (outcome.success) {
+      return { ok: true, result: forwardReq.result };
+    }
+    return { ok: false, errorType: outcome.errorType, raw: forwardReq };
+  }
+
+  const firstMsg = messages[0];
+  const messageIds = messages.map(m => m.message_id);
+  const payload = {
+    chat_id: target.chatId,
+    from_chat_id: firstMsg.chat.id,
+    message_ids: messageIds
+  };
+  if (target.threadId) payload.message_thread_id = target.threadId;
+
+  const forwardReq = await forwardMessagesWithFallback(payload);
+  const outcome = await handleBatchForwardResult(forwardReq, messages, target, userId, messageIds.length);
+  if (outcome.success) {
+    return { ok: true, result: forwardReq.result };
+  }
+  return { ok: false, errorType: outcome.errorType, raw: forwardReq };
+}
+
+async function handleSingleForwardResult(result, msg, target, userId) {
+  if (result.ok && result.result && result.result.message_id) {
+    await storeForwardMapping(result.result.message_id, msg, target);
+    return { success: true };
+  }
+
+  if (!result.ok && shouldAttemptCopyFallback(target)) {
+    const copyOutcome = await tryCopySingleMessage(msg, target);
+    if (copyOutcome.success) {
+      return { success: true };
+    }
+    result = copyOutcome.rawResult || result;
+  }
+
+  const errorType = result.errorType || 'unknown';
+  if (errorType === 'message_not_found') {
+    Logger.warn('message_not_found', { userId, messageId: msg.message_id, target: target.label });
+    return { success: true };
+  }
+  if (errorType === 'thread_not_found' && target.label === 'topic') {
+    Logger.warn('topic_thread_not_found', { userId, threadId: target.threadId });
+    return { success: false, errorType };
+  }
+  if (errorType === 'bot_blocked' && target.label === 'admin_dm') {
+    Logger.warn('bot_blocked_by_admin', { userId, adminId: ADMIN_UID });
+    await sendMessage({
+      chat_id: userId,
+      text: '⚠️ 消息发送失败：管理员已屏蔽机器人，无法接收消息。'
+    });
+    return { success: false, errorType };
+  }
+
+  await notifyForwardFailure(target, result);
+  return { success: false, errorType };
+}
+
+async function handleBatchForwardResult(result, messages, target, userId, count) {
+  if (result.ok && Array.isArray(result.result)) {
+    for (let i = 0; i < messages.length; i++) {
+      const forwardedMsg = result.result[i];
+      const origMsg = messages[i];
+      if (forwardedMsg && forwardedMsg.message_id) {
+        await storeForwardMapping(forwardedMsg.message_id, origMsg, target);
+      }
+    }
+    return { success: true };
+  }
+
+  if (!result.ok && shouldAttemptCopyFallback(target)) {
+    const fallbackResult = await copyMessagesIndividually(messages, target);
+    if (fallbackResult.success) {
+      return { success: true };
+    }
+    result = fallbackResult.rawResult || result;
+  }
+
+  const errorType = result.errorType || 'unknown';
+  if (errorType === 'message_not_found') {
+    Logger.warn('batch_messages_not_found', { userId, target: target.label, count });
+    return { success: true };
+  }
+  if (errorType === 'thread_not_found' && target.label === 'topic') {
+    Logger.warn('batch_topic_thread_not_found', { userId, target: target.label, threadId: target.threadId });
+    return { success: false, errorType };
+  }
+
+  await notifyForwardFailure(target, result);
+  return { success: false, errorType };
+}
+
+async function storeForwardMapping(forwardedMessageId, originalMessage, target = null) {
+  if (!forwardedMessageId || !originalMessage) return;
+  try {
+    await KV.put('msg-map-' + forwardedMessageId, originalMessage.chat.id.toString(), { expirationTtl: 172800 });
+    await KV.put('orig-map-' + originalMessage.message_id, forwardedMessageId.toString(), { expirationTtl: 172800 });
+    if (target && target.chatId) {
+      await KV.put(
+        'fwd-loc-' + forwardedMessageId,
+        JSON.stringify({ chat_id: target.chatId, thread_id: target.threadId || null }),
+        { expirationTtl: 172800 }
+      );
+    }
+  } catch (e) {
+    Logger.warn('store_forward_mapping_failed', e, {
+      forwardedMessageId,
+      originalMessageId: originalMessage.message_id
+    });
+  }
+}
+
+async function notifyForwardFailure(target, result) {
+  const recipient = ADMIN_UID || target.chatId;
+  const hint = target.label === 'topic' ? '请检查机器人是否为群组管理员，并确认群组已启用话题。' : '';
+  await sendMessage({
+    chat_id: recipient,
+    text: `❌ 转发消息失败：${result.userMessage || result.description || '未知错误'}${hint ? `\n\n${hint}` : ''}`
   });
 }
 
 // 处理访客编辑后的消息
+function shouldAttemptCopyFallback(target) {
+  return target && target.label === 'topic';
+}
+
+async function tryCopySingleMessage(msg, target) {
+  const payload = {
+    chat_id: target.chatId,
+    from_chat_id: msg.chat.id,
+    message_id: msg.message_id
+  };
+  if (target.threadId) payload.message_thread_id = target.threadId;
+
+  const copyReq = await requestTelegram('copyMessage', payload);
+  if (copyReq.ok && copyReq.result && copyReq.result.message_id) {
+    await storeForwardMapping(copyReq.result.message_id, msg, target);
+    return { success: true };
+  }
+  return { success: false, rawResult: copyReq };
+}
+
+async function copyMessagesIndividually(messages, target) {
+  for (const msg of messages) {
+    const payload = {
+      chat_id: target.chatId,
+      from_chat_id: msg.chat.id,
+      message_id: msg.message_id
+    };
+    if (target.threadId) payload.message_thread_id = target.threadId;
+
+    const copyReq = await requestTelegram('copyMessage', payload);
+    if (copyReq.ok && copyReq.result && copyReq.result.message_id) {
+      await storeForwardMapping(copyReq.result.message_id, msg, target);
+    } else {
+      return { success: false, rawResult: copyReq };
+    }
+  }
+  return { success: true };
+}
+
 async function handleGuestEditedMessage(message) {
   const origMessageId = message.message_id.toString();
   const chatId = message.chat.id.toString();
 
   // 查找原始消息转发后的 ID（用于回复引用）
-  const forwardedMessageId = await KV.get('orig-map-' + origMessageId);
+  const forwardedMessageIdRaw = await KV.get('orig-map-' + origMessageId);
+  let forwardedMessageId = null;
+  let forwardLocation = null;
+  if (forwardedMessageIdRaw) {
+    const numericId = parseInt(forwardedMessageIdRaw, 10);
+    forwardedMessageId = Number.isNaN(numericId) ? forwardedMessageIdRaw : numericId;
+    const locRaw = await KV.get('fwd-loc-' + forwardedMessageIdRaw);
+    if (locRaw) {
+      try {
+        forwardLocation = JSON.parse(locRaw);
+      } catch (e) {
+        Logger.warn('parse_forward_location_failed', e, { forwardedMessageId: forwardedMessageIdRaw });
+      }
+    }
+  }
 
   // 查找是否已有编辑提示消息
   const editNoticeKey = `edit-notice:${chatId}:${origMessageId}`;
-  const existingNoticeId = await KV.get(editNoticeKey);
+  let existingNotice = null;
+  const existingNoticeRaw = await KV.get(editNoticeKey);
+  if (existingNoticeRaw) {
+    try {
+      existingNotice = JSON.parse(existingNoticeRaw);
+    } catch (e) {
+      existingNotice = { chat_id: ADMIN_UID, message_id: parseInt(existingNoticeRaw, 10) || existingNoticeRaw };
+      Logger.warn('parse_edit_notice_failed', e, { editNoticeKey });
+    }
+  }
 
   const editNotice = `✏️ ${escapeHtml(message.text || '(无文本内容)')}`;
 
-  if (existingNoticeId) {
+  if (existingNotice) {
     // 已有编辑提示，尝试更新
     try {
       const editReq = await requestTelegram('editMessageText', {
-        chat_id: ADMIN_UID,
-        message_id: parseInt(existingNoticeId),
+        chat_id: existingNotice.chat_id || ADMIN_UID,
+        message_id: parseInt(existingNotice.message_id),
         text: editNotice,
         parse_mode: 'HTML'
       });
@@ -3702,18 +6408,35 @@ async function handleGuestEditedMessage(message) {
   }
 
   // 发送新的编辑提示
-  const result = await sendMessage({
-    chat_id: ADMIN_UID,
+  const targetChatId = forwardLocation?.chat_id || ADMIN_UID;
+  const targetThreadId = forwardLocation?.thread_id || null;
+  const sendPayload = {
+    chat_id: targetChatId,
     text: editNotice,
-    parse_mode: 'HTML',
-    reply_to_message_id: forwardedMessageId || undefined
-  });
+    parse_mode: 'HTML'
+  };
+  const replyToId = forwardedMessageId ? Number(forwardedMessageId) : null;
+  if (replyToId) {
+    sendPayload.reply_to_message_id = replyToId;
+  }
+  if (targetThreadId) {
+    sendPayload.message_thread_id = targetThreadId;
+  }
+  const result = await sendMessage(sendPayload);
 
   // 存储映射关系
   if (result.ok && result.result && result.result.message_id) {
     await KV.put('msg-map-' + result.result.message_id, chatId, { expirationTtl: 172800 });
-    // 存储编辑提示消息ID，用于后续更新
-    await KV.put(editNoticeKey, result.result.message_id.toString(), { expirationTtl: 172800 });
+    // 存储编辑提示消息ID、位置，用于后续更新
+    await KV.put(
+      editNoticeKey,
+      JSON.stringify({
+        chat_id: targetChatId,
+        message_id: result.result.message_id,
+        thread_id: targetThreadId
+      }),
+      { expirationTtl: 172800 }
+    );
   }
 }
 
@@ -3799,110 +6522,162 @@ async function handleQuizCallback(callbackQuery) {
   const messageId = callbackQuery.message.message_id;
   const chatId = callbackQuery.message.chat.id;
 
-  // 【优化】解析答案索引，严格验证格式
-  const parts = data.split(':');
-  if (parts.length !== 2) {
-    return requestTelegram('answerCallbackQuery', {
-      callback_query_id: callbackQuery.id,
-      text: '❌ 无效的数据格式',
-      show_alert: true
-    });
-  }
-
-  const answerIndex = parseInt(parts[1]);
-  if (isNaN(answerIndex) || answerIndex < 0 || answerIndex > 3) {
-    return requestTelegram('answerCallbackQuery', {
-      callback_query_id: callbackQuery.id,
-      text: '❌ 无效的选项',
-      show_alert: true
-    });
-  }
-
-  // 【优化】检查验证尝试频率限制
-  const attemptLimit = checkRateLimit(userId, 'verifyAttempt');
-  if (!attemptLimit.allowed) {
-    return requestTelegram('answerCallbackQuery', {
-      callback_query_id: callbackQuery.id,
-      text: `⏳ 尝试过于频繁，请等待 ${attemptLimit.retryAfter} 秒后再试`,
-      show_alert: true
-    });
-  }
-
-  // 验证答案
-  const result = await verifyQuizAnswer(userId, answerIndex);
-
-  if (result.success) {
-    // 答案正确，标记用户已验证
-    const verifiedKey = 'verified-' + userId;
-    await KV.put(verifiedKey, 'true', { expirationTtl: VERIFICATION_TTL });
-    memSet(verifiedKey, 'true', 5 * 60 * 1000);
-
-    // 添加到已验证用户列表
-    const user = callbackQuery.from;
-    const userName = user.username || user.first_name || 'Unknown';
-    await addVerifiedUser(userId, userName);
-
-    // 缓存用户资料
-    await upsertUserProfileFromUpdate(user);
-
-    // 处理暂存的消息
-    const pendingResult = await processPendingMessagesAfterVerification(userId);
-    Logger.info('local_quiz_verification_success', { userId, pendingForwarded: pendingResult.forwarded });
-
-    // 构建成功消息
-    let successText = '✅ 验证成功！您现在可以发送消息给管理员了。';
-    if (pendingResult.forwarded > 0) {
-      successText = `✅ 验证成功！\n\n📩 刚才的 ${pendingResult.forwarded} 条消息已送达管理员。`;
+  try {
+    // 【并发保护】尝试获取验证锁
+    const lockResult = await tryAcquireVerifyLock(userId);
+    if (!lockResult.acquired) {
+      const waitTime = Math.ceil(lockResult.lockInfo.remainingMs / 1000);
+      return requestTelegram('answerCallbackQuery', {
+        callback_query_id: callbackQuery.id,
+        text: `⏳ 验证进行中，请等待 ${waitTime} 秒后再试`,
+        show_alert: true
+      });
     }
 
-    // 更新消息为成功状态
-    await requestTelegram('editMessageText', {
-      chat_id: chatId,
-      message_id: messageId,
-      text: successText,
-      parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [] }
-    });
+    // 【优化】解析答案索引，严格验证格式
+    const parts = data.split(':');
+    if (parts.length !== 2) {
+      await releaseVerifyLock(userId);
+      return requestTelegram('answerCallbackQuery', {
+        callback_query_id: callbackQuery.id,
+        text: '❌ 无效的数据格式',
+        show_alert: true
+      });
+    }
 
-    // 发送欢迎消息（如果没有暂存消息转发）
-    if (pendingResult.forwarded === 0) {
-      const welcomeMsg = await getConfig(CONFIG_KEYS.WELCOME_MSG);
-      if (welcomeMsg) {
-        await sendMessage({
-          chat_id: userId,
-          text: welcomeMsg
+    const answerIndex = parseInt(parts[1]);
+    if (isNaN(answerIndex) || answerIndex < 0 || answerIndex > 3) {
+      await releaseVerifyLock(userId);
+      return requestTelegram('answerCallbackQuery', {
+        callback_query_id: callbackQuery.id,
+        text: '❌ 无效的选项',
+        show_alert: true
+      });
+    }
+
+    // 【优化】检查验证尝试频率限制
+    const attemptLimit = checkRateLimit(userId, 'verifyAttempt');
+    if (!attemptLimit.allowed) {
+      await releaseVerifyLock(userId);
+      return requestTelegram('answerCallbackQuery', {
+        callback_query_id: callbackQuery.id,
+        text: `⏳ 尝试过于频繁，请等待 ${attemptLimit.retryAfter} 秒后再试`,
+        show_alert: true
+      });
+    }
+
+    // 验证答案
+    const result = await verifyQuizAnswer(userId, answerIndex);
+
+    if (result.success) {
+      // 答案正确，标记用户已验证
+      const verifiedKey = 'verified-' + userId;
+      await KV.put(verifiedKey, 'true', { expirationTtl: VERIFICATION_TTL });
+      memSet(verifiedKey, 'true', 5 * 60 * 1000);
+
+      // 添加到已验证用户列表
+      const user = callbackQuery.from;
+      const userName = user.username || user.first_name || 'Unknown';
+      await addVerifiedUser(userId, userName);
+
+      // 缓存用户资料
+      await upsertUserProfileFromUpdate(user);
+
+      // 处理暂存的消息
+      let pendingResult = { forwarded: 0, failed: 0 };
+      try {
+        pendingResult = await processPendingMessagesAfterVerification(userId);
+        Logger.info('local_quiz_verification_success', { userId, pendingForwarded: pendingResult.forwarded });
+      } catch (e) {
+        Logger.error('process_pending_messages_failed', e, { userId });
+      }
+
+      // 构建成功消息
+      let successText = '✅ 验证成功！您现在可以发送消息给管理员了。';
+      if (pendingResult.forwarded > 0) {
+        successText = `✅ 验证成功！\n\n📩 刚才的 ${pendingResult.forwarded} 条消息已送达管理员。`;
+      }
+
+      // 更新消息为成功状态
+      try {
+        await requestTelegram('editMessageText', {
+          chat_id: chatId,
+          message_id: messageId,
+          text: successText,
+          parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [] }
+        });
+      } catch (e) {
+        Logger.error('edit_message_text_failed', e, { userId });
+      }
+
+      // 发送欢迎消息（如果没有暂存消息转发）
+      if (pendingResult.forwarded === 0) {
+        try {
+          const welcomeMsg = await getConfig(CONFIG_KEYS.WELCOME_MSG);
+          if (welcomeMsg) {
+            await sendMessage({
+              chat_id: userId,
+              text: welcomeMsg
+            });
+          }
+        } catch (e) {
+          Logger.error('send_welcome_msg_failed', e, { userId });
+        }
+      }
+
+      // 记录活跃
+      try {
+        await recordActiveUser(userId);
+      } catch (e) {
+        Logger.error('record_active_user_failed', e, { userId });
+      }
+
+      await releaseVerifyLock(userId);
+      return requestTelegram('answerCallbackQuery', {
+        callback_query_id: callbackQuery.id,
+        text: '验证成功！'
+      });
+    } else {
+      // 答案错误
+      if (result.reason === 'expired' || result.reason === 'max_attempts') {
+        // 题目过期或尝试次数过多，删除按钮
+        try {
+          await requestTelegram('editMessageReplyMarkup', {
+            chat_id: chatId,
+            message_id: messageId,
+            reply_markup: { inline_keyboard: [] }
+          });
+        } catch (e) {
+          Logger.error('edit_reply_markup_failed', e, { userId });
+        }
+
+        await releaseVerifyLock(userId);
+        return requestTelegram('answerCallbackQuery', {
+          callback_query_id: callbackQuery.id,
+          text: result.message,
+          show_alert: true
         });
       }
-    }
 
-    // 记录活跃
-    await recordActiveUser(userId);
-
-    return requestTelegram('answerCallbackQuery', {
-      callback_query_id: callbackQuery.id,
-      text: '验证成功！'
-    });
-  } else {
-    // 答案错误
-    if (result.reason === 'expired' || result.reason === 'max_attempts') {
-      // 题目过期或尝试次数过多，删除按钮
-      await requestTelegram('editMessageReplyMarkup', {
-        chat_id: chatId,
-        message_id: messageId,
-        reply_markup: { inline_keyboard: [] }
-      });
-
+      // 答案错误但还可以继续尝试
+      await releaseVerifyLock(userId);
       return requestTelegram('answerCallbackQuery', {
         callback_query_id: callbackQuery.id,
         text: result.message,
         show_alert: true
       });
     }
-
-    // 答案错误但还可以继续尝试
+  } catch (e) {
+    Logger.error('handle_quiz_callback_failed', e, { userId });
+    try {
+      await releaseVerifyLock(userId);
+    } catch (e2) {
+      Logger.error('release_lock_failed', e2, { userId });
+    }
     return requestTelegram('answerCallbackQuery', {
       callback_query_id: callbackQuery.id,
-      text: result.message,
+      text: '❌ 验证处理出错，请重试',
       show_alert: true
     });
   }
