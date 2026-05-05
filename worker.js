@@ -3194,6 +3194,7 @@ async function onMessage(message, origin) {
   const chatId = message.chat.id.toString();
   const senderId = message.from ? String(message.from.id) : null;
   const isGroupAdminChat = GROUP_ID && chatId === GROUP_ID;
+  const isInTopic = message.message_thread_id && isGroupAdminChat;
 
   // 缓存用户资料（从消息中）
   if (message.from) {
@@ -3208,6 +3209,17 @@ async function onMessage(message, origin) {
   // 2. 如果是访客 (普通用户)
   else {
     const text = (message.text || '').trim();
+
+    // 【话题模式】如果在话题中收到消息，说明用户已经在话题内，不需要验证
+    // 这可能是用户在 General 话题或其他话题中发送的消息
+    if (isInTopic) {
+      Logger.debug('message_in_topic_ignored', {
+        userId: chatId,
+        threadId: message.message_thread_id,
+        text: text ? text.substring(0, 50) : '[media]'
+      });
+      return; // 忽略话题中的消息，不触发验证
+    }
 
     // 【防骚扰】拦截普通用户发送的指令（除 /start 外）
     if (text.startsWith('/') && text !== '/start') {
@@ -3290,6 +3302,27 @@ async function onMessage(message, origin) {
       // 4. 检查垃圾消息过滤
       const spamCheck = await checkSpam(message, chatId);
       if (spamCheck.isSpam) {
+        // 【话题模式】如果在话题中发送屏蔽词，静默转发到垃圾话题，但在话题中提示用户
+        if (isInTopic) {
+          Logger.debug('spam_in_topic_silenced', {
+            userId: chatId,
+            threadId: message.message_thread_id,
+            reason: spamCheck.reason
+          });
+          // 如果启用了垃圾话题，静默转发
+          const spamTopicEnabled = await isSpamTopicEnabled();
+          const spamTopicConfig = await getSpamTopicConfig();
+          if (spamTopicEnabled && spamTopicConfig.topicId && GROUP_ID) {
+            await silentlyForwardSpamMessage(message, GROUP_ID, spamTopicConfig.topicId);
+          }
+          // 【话题模式】在话题中提示用户
+          return sendMessage({
+            chat_id: GROUP_ID,
+            message_thread_id: message.message_thread_id,
+            text: '🚫 您的消息因违反规则被拦截。如有疑问请联系管理员。'
+          });
+        }
+
         // 检查垃圾话题功能是否启用
         const spamTopicEnabled = await isSpamTopicEnabled();
         const spamTopicConfig = await getSpamTopicConfig();
@@ -3356,9 +3389,11 @@ async function onMessage(message, origin) {
 // 处理编辑后的消息
 async function onEditedMessage(message, origin) {
   const chatId = message.chat.id.toString();
+  const senderId = message.from ? String(message.from.id) : null;
+  const isGroupAdminChat = GROUP_ID && chatId === GROUP_ID;
 
   // 1. 如果是管理员发消息（编辑回复）
-  if (isAdmin(chatId)) {
+  if (isAdmin(chatId) || (isGroupAdminChat && senderId && isAdmin(senderId))) {
     return handleAdminEditedMessage(message);
   }
 
@@ -4732,6 +4767,17 @@ async function handleAdminMessage(message) {
   // 【话题模式支持】检测是否在话题中发送消息
   const isTopicMode = await isTopicForwardingEnabled();
   const isInTopic = isTopicMode && contextChatId === GROUP_ID && message.message_thread_id;
+  const isInGeneralTopic = isInTopic && message.message_thread_id === 1; // General 话题 ID 为 1
+
+  Logger.info('admin_message_context', {
+    contextChatId,
+    GROUP_ID,
+    message_thread_id: message.message_thread_id,
+    isTopicMode,
+    isInTopic,
+    isInGeneralTopic,
+    text: text.substring(0, 50)
+  });
 
   // 辅助函数：获取回复目标（话题模式或私聊模式）
   const getReplyTarget = () => {
@@ -4745,6 +4791,9 @@ async function handleAdminMessage(message) {
       chat_id: adminChatId
     };
   };
+
+  // 【关键词管理】检查是否允许添加关键词（只在 General 话题或私聊中）
+  const canManageKeywords = !isInTopic || isInGeneralTopic;
 
   // 【垃圾话题配置】检查是否在配置垃圾话题 ID 的等待状态
   const spamTopicWaitKey = `spam_topic_config_wait:${adminChatId}`;
@@ -4972,6 +5021,7 @@ async function handleAdminMessage(message) {
   // 关键词管理 - 添加正则
   if (text.startsWith('regex:')) {
     const regex = text.slice(6).trim();
+    const replyTarget = getReplyTarget();
     if (regex) {
       const rules = await getSpamFilterRules();
       if (!rules.regexes) rules.regexes = [];
@@ -4979,9 +5029,9 @@ async function handleAdminMessage(message) {
         new RegExp(regex, 'i'); // 验证正则有效性
         rules.regexes.push(regex);
         await setSpamFilterRules(rules);
-        return sendMessage({ chat_id: adminChatId, text: `✅ 已添加正则规则：<code>${escapeHtml(regex)}</code>`, parse_mode: 'HTML' });
+        return sendMessage({ ...replyTarget, text: `✅ 已添加正则规则：<code>${escapeHtml(regex)}</code>`, parse_mode: 'HTML' });
       } catch (e) {
-        return sendMessage({ chat_id: adminChatId, text: '❌ 正则表达式无效。' });
+        return sendMessage({ ...replyTarget, text: '❌ 正则表达式无效。' });
       }
     }
   }
@@ -4989,53 +5039,68 @@ async function handleAdminMessage(message) {
   // 关键词管理 - 删除拦截词
   if (text.startsWith('del:')) {
     const keyword = text.slice(4).trim();
+    const replyTarget = getReplyTarget();
     if (keyword) {
       const rules = await getSpamFilterRules();
       const index = (rules.keywords || []).indexOf(keyword);
       if (index > -1) {
         rules.keywords.splice(index, 1);
         await setSpamFilterRules(rules);
-        return sendMessage({ chat_id: adminChatId, text: `✅ 已删除拦截关键词：<code>${escapeHtml(keyword)}</code>`, parse_mode: 'HTML' });
+        return sendMessage({ ...replyTarget, text: `✅ 已删除拦截关键词：<code>${escapeHtml(keyword)}</code>`, parse_mode: 'HTML' });
       }
-      return sendMessage({ chat_id: adminChatId, text: '⚠️ 未找到该拦截关键词。' });
+      return sendMessage({ ...replyTarget, text: '⚠️ 未找到该拦截关键词。' });
     }
   }
 
   // 关键词管理 - 删除放行词
   if (text.startsWith('delallow:')) {
     const keyword = text.slice(9).trim();
+    const replyTarget = getReplyTarget();
     if (keyword) {
       const rules = await getSpamFilterRules();
       const index = (rules.allowKeywords || []).indexOf(keyword);
       if (index > -1) {
         rules.allowKeywords.splice(index, 1);
         await setSpamFilterRules(rules);
-        return sendMessage({ chat_id: adminChatId, text: `✅ 已删除放行关键词：<code>${escapeHtml(keyword)}</code>`, parse_mode: 'HTML' });
+        return sendMessage({ ...replyTarget, text: `✅ 已删除放行关键词：<code>${escapeHtml(keyword)}</code>`, parse_mode: 'HTML' });
       }
-      return sendMessage({ chat_id: adminChatId, text: '⚠️ 未找到该放行关键词。' });
+      return sendMessage({ ...replyTarget, text: '⚠️ 未找到该放行关键词。' });
     }
   }
 
   // 关键词管理 - 清空默认规则
   if (text === '清空默认') {
+    const replyTarget = getReplyTarget();
     await resetSpamFilterRules();
-    return sendMessage({ chat_id: adminChatId, text: '✅ 已重置为默认规则。' });
+    return sendMessage({ ...replyTarget, text: '✅ 已重置为默认规则。' });
   }
 
   // 链接数量设置
   if (text.startsWith('max_links:')) {
     const num = parseInt(text.slice(10));
+    const replyTarget = getReplyTarget();
     if (!isNaN(num) && num >= 0) {
       const rules = await getSpamFilterRules();
       rules.maxLinks = num;
       await setSpamFilterRules(rules);
-      return sendMessage({ chat_id: adminChatId, text: `✅ 链接限制已设置为：${num}` });
+      return sendMessage({ ...replyTarget, text: `✅ 链接限制已设置为：${num}` });
     }
-    return sendMessage({ chat_id: adminChatId, text: '⚠️ 请输入有效的数字。' });
+    return sendMessage({ ...replyTarget, text: '⚠️ 请输入有效的数字。' });
   }
 
   // 普通文本 - 添加为拦截关键词（如果不是命令）
+  // 【限制】只在 General 话题或私聊中允许添加关键词
   if (!reply && text && !text.startsWith('/') && text.length > 0) {
+    const replyTarget = getReplyTarget();
+
+    if (!canManageKeywords) {
+      // 在用户话题中发送文本，不添加关键词，提示用户
+      return sendMessage({
+        ...replyTarget,
+        text: 'ℹ️ 关键词管理只能在 General 话题或私聊中进行。\n\n当前在用户话题中，消息将转发给该用户。'
+      });
+    }
+
     // 检查是否在关键词管理上下文中
     const rules = await getSpamFilterRules();
     if (!rules.keywords) rules.keywords = [];
@@ -5044,7 +5109,7 @@ async function handleAdminMessage(message) {
     if (!rules.keywords.includes(text)) {
       rules.keywords.push(text);
       await setSpamFilterRules(rules);
-      return sendMessage({ chat_id: adminChatId, text: `✅ 已添加拦截关键词：<code>${escapeHtml(text)}</code>\n发送 del:${escapeHtml(text)} 删除`, parse_mode: 'HTML' });
+      return sendMessage({ ...replyTarget, text: `✅ 已添加拦截关键词：<code>${escapeHtml(text)}</code>\n发送 del:${escapeHtml(text)} 删除`, parse_mode: 'HTML' });
     }
   }
 
@@ -6068,24 +6133,32 @@ async function handleVerifyCallback(request) {
       text: successMsg
     });
 
-    let usernameLine = '';
-    if (userInfo && userInfo.username) {
-      usernameLine = `
+    // 【话题模式】检查是否启用了话题模式
+    const topicModeEnabled = await isTopicForwardingEnabled();
+    if (topicModeEnabled && GROUP_ID) {
+      // 话题模式：在创建话题时发送欢迎消息，这里不发送到管理员私聊
+      Logger.info('topic_mode_enabled_skip_admin_notify', { userId: uid });
+    } else {
+      // 私聊模式：发送到管理员私聊
+      let usernameLine = '';
+      if (userInfo && userInfo.username) {
+        usernameLine = `
 📎 @${escapeHtml(userInfo.username)}`;
-    }
-    await requestTelegram('sendMessage', {
-      chat_id: ADMIN_UID,
-      text: `✅ <b>新用户验证通过</b>
+      }
+      await requestTelegram('sendMessage', {
+        chat_id: ADMIN_UID,
+        text: `✅ <b>新用户验证通过</b>
 
 🆔 <code>${uid}</code> (${escapeHtml(displayName)})${usernameLine}`,
-      parse_mode: 'HTML',
-      link_preview_options: { is_disabled: true },
-      reply_markup: {
-        inline_keyboard: [[
-          { text: '👤 打开用户资料', url: `tg://user?id=${uid}` }
-        ]]
-      }
-    });
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '👤 打开用户资料', url: `tg://user?id=${uid}` }
+          ]]
+        }
+      });
+    }
 
     return new Response(JSON.stringify({ success: true }), {
       status: 200,
