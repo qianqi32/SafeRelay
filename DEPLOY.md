@@ -91,7 +91,7 @@
 |:----:|:----:|:-----|:----:|
 | `ENV_BOT_TOKEN` | 密钥 | Telegram Bot Token | `123456:ABC-DEF...` |
 | `ENV_BOT_SECRET` | 密钥 | 用于 `/registerWebhook` 的开头网站获取的 `随机UUID`也可自己填写 | `d7ecca95-e45e-41f4-b018-d5cc05486283` |
-| `ENV_ADMIN_UID`` | 文本 | 你的TGID 至少填写一个管理员ID。 | `123456789` |
+| `ENV_ADMIN_UID` | 文本 | 你的TGID 至少填写一个管理员ID。 | `123456789` |
 
 ### 建议添加
 | 变量 | 类型 | 说明 | 示例 |
