@@ -7,6 +7,7 @@ SafeRelay 是一个轻量级的 Telegram 私聊机器人，专注于防骚扰和
 机器人采用 Serverless 架构，无需服务器即可部署，零成本运行！
 
 部署教程请查看 [DEPLOY.md](./DEPLOY.md)。
+图片部署教程请查看 [图片.md](./picture.md)。
 
 ## ✨ 功能特性
 
