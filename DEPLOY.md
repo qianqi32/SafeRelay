@@ -11,7 +11,7 @@
 | 项目 | 获取方式 | 用途 |
 |------|----------|------|
 | **Telegram Bot Token** | [@BotFather](https://t.me/BotFather) 创建机器人 | 机器人身份认证 |
-| **Admin UID / ADMIN_IDS** | [@userinfobot](https://t.me/userinfobot) 获取你的 User ID | 管理员身份验证。可填写一个 `ENV_ADMIN_UID`，或在 `ADMIN_IDS` 中写入多个 ID（逗号/空格分隔） |
+| **Admin UID / ADMIN_IDS** | [@userinfobot](https://t.me/userinfobot) 获取你的 TG ID | 管理员身份验证。可填写一个 `ENV_ADMIN_UID`，或在 `ADMIN_IDS` 中写入多个 ID（逗号/空格分隔） |
 | **Webhook 密钥** | [UUID 生成器](https://www.uuidgenerator.net/) 生成随机 UUID | Webhook 安全验证 |
 | **Turnstile Site Key** | Cloudflare Dashboard 创建 | 人机验证 |
 | **Turnstile Secret Key** | Cloudflare Dashboard 创建 | 人机验证 |
@@ -20,19 +20,19 @@
 
 ## 步骤 1：配置 Cloudflare Turnstile（必需）
 
-前往 `Cloudflare Dashboard` → `应用程序安全` → `Turnstile`：
+前往 `Cloudflare左边工具栏` → `应用程序安全` → `Turnstile`：
 
 1. 点击 **添加小组件** 按钮
-2. **小组件名称**：填写 `saferelay`（或其他名称）
+2. **小组件名称**：填写 `tgbot`（或其他名称）
 3. **主机名管理**：点击 **添加主机名** 按钮
    - 选择 **添加自定义主机名**
-   - 填写你的 Workers 域名，例如 `yourname.workers.dev`
+   - 填写你的 Workers 域名或自己的域名，例如 `qianqi.workers.dev` 改成自己的
    - 点击输入框旁边的 **添加** 按钮
    - 点击下方的 **添加** 按钮确认
 4. 点击 **创建** 按钮
 5. **保存密钥**：创建成功后会显示
-   - **站点密钥 (Site Key)**：复制保存
-   - **密钥 (Secret Key)**：复制保存
+   - **站点密钥**：复制保存
+   - **密钥**：复制保存
 
 > ⚠️ **重要**：这两个密钥稍后要填写到代码中！
 
@@ -40,67 +40,72 @@
 
 ## 步骤 2：创建 KV 命名空间
 
-前往 `Cloudflare Dashboard` → `Storage & Databases` → `Workers KV`：
+前往 `Cloudflare左边工具栏` → `存储和数据库` → `Workers KV`：
 
-1. 点击 `Create a Namespace`（创建命名空间）
-2. 命名为 `saferelay_kv`（或其他你喜欢的名字）
-3. 点击 `Add`（添加）
+1. 点击右上角  `Create Instance`（创建命名空间）
+2. 命名为 `tgbot_kv`（或其他你喜欢的名字）
+3. 点击 `创建`（添加）
 
 ---
 
 ## 步骤 3：创建 Worker
 
-前往 `Cloudflare Dashboard` → `Compute & AI` → `Workers & Pages`：
+前往 `Cloudflare左边工具栏` → `计算` → `Workers & Pages`：
 
-1. 点击 `Create Application`（创建应用程序）
-2. 选择 `HTTP Handler` 模板
-3. `Worker Name` 填写 `saferelay`（或其他你喜欢的名字）
-4. 点击 `Deploy`（部署）
+1. 点击 `创建应用程序`
+2. 选择 `从 Hello World! 开始` 
+3. `Worker Name` 填写 `tgbot`（或其他你喜欢的名字）
+4. 点击 `部署`
 
 ---
 
 ## 步骤 4：编辑代码
 
-1. 进入 `Workers & Pages` → 你的 Worker 名称 → `Edit Code`（编辑代码）
+1. 进入 `Workers & Pages` → 刚才创建的 tgbot → 右上角`编辑代码`，手机可能在二级菜单里也是右上角
 2. 将 [worker.js](./worker.js) 的内容完整复制粘贴进去，覆盖原有代码
 3. 代码无需改动，所有密钥都会在下一步通过环境变量注入
-4. 点击右上角的 `Deploy`（部署）保存
+4. 点击右上角的 `部署`保存
 
 ---
 
 ## 步骤 5：绑定 KV
 
-进入 `Workers & Pages` → 你的 Worker 名称 → `Settings`（设置） → `Bindings`（绑定）：
+进入 `Workers & Pages` → 刚才创建的 tgbot → `绑定` ：
 
-1. 点击 `Add`（添加绑定）
-2. 选择 `KV Namespace`（KV 命名空间）
-3. `Variable name` **必须填写 `KV`**（必须大写，代码中写死了这个名字）
-4. `KV Namespace` 选择刚才创建的 `saferelay_kv`
-5. 点击 `Save and deploy`（保存并部署）
+1. 点击右边 `添加绑定+`
+2. 选择 `KV 命名空间`
+3. `添加绑定`
+4. `变量名称` **必须填写 `KV`**（必须大写，必须大写，必须大写，代码中写死了这个名字）
+5. `KV命名空间` 选择刚才创建的 `tgbot_kv`
+6. 点击 `添加绑定`
 
 ---
 
 ## 步骤 6：设置环境变量
 
-进入 `Workers & Pages` → 你的 Worker 名称 → `Settings` → `Variables`：
+进入 `Workers & Pages` → 刚才创建的 tgbot → `设置` → `变量和机密`：
 
 ### 必填变量
 
 | 变量 | 类型 | 说明 | 示例 |
 |:----:|:----:|:-----|:----:|
-| `ENV_BOT_TOKEN` | Secret | Telegram Bot Token | `123456:ABC-DEF...` |
-| `ENV_BOT_SECRET` | Secret | 用于 `/registerWebhook` 的 `secret_token`（任意随机串） | `random_string_123` |
-| `ENV_ADMIN_UID` / `ADMIN_IDS` | Plain text | 至少填写一个管理员 ID。`ADMIN_IDS` 支持多个 ID，以逗号或空格分隔 | `123456789,987654321` |
+| `ENV_BOT_TOKEN` | 密钥 | Telegram Bot Token | `123456:ABC-DEF...` |
+| `ENV_BOT_SECRET` | 密钥 | 用于 `/registerWebhook` 的开头网站获取的 `随机UUID`也可自己填写 | `d7ecca95-e45e-41f4-b018-d5cc05486283` |
+| `ENV_ADMIN_UID`` | 文本 | 你的TGID 至少填写一个管理员ID。 | `123456789` |
 
-### 可选变量
+### 建议添加
+| 变量 | 类型 | 说明 | 示例 |
+|:----:|:----:|:-----|:----:|
+| `CF_TURNSTILE_SITE_KEY` | 密钥 | `站点密钥` 刚才复制到那个） | `0x4AAAAAA...` |
+| `CF_TURNSTILE_SECRET_KEY` | 密钥 | `密钥` 刚才复制到那个 | `0x4AAAAAA...` |
+| `GROUP_ID` | 文本 | 你的群组ID | `-1001234567890` |
+
+### 可选变量 下方变量没有进行汉化 有能力的可以看看
 
 | 变量 | 类型 | 说明 | 示例 |
 |:----:|:----:|:-----|:----:|
 | `ADMIN_IDS` | Plain text | 多管理员列表；即使已经设置 `ENV_ADMIN_UID` 也建议写在这里 | `111,222,333` |
-| `CF_TURNSTILE_SITE_KEY` | Secret | Turnstile 站点密钥（启用网页验证时需要） | `0x4AAAAAA...` |
-| `CF_TURNSTILE_SECRET_KEY` | Secret | Turnstile 密钥（启用网页验证时需要） | `0x4AAAAAA...` |
 | `WORKERS_AI_ENABLED` | Plain text | 启用 Workers AI 垃圾检测 | `true` |
-| `GROUP_ID` | Plain text | 论坛群组 / Topics 模式所需 | `-1001234567890` |
 | `TURNSTILE_ALLOWED_HOSTNAMES` | Plain text | Turnstile Hostname 白名单，逗号或空格分隔 | `bot.example.com workers.dev` |
 | `TURNSTILE_ACTION` | Plain text | Turnstile Action 校验值 | `tg_verify` |
 | `VERIFY_SIGNING_SECRET` | Secret | 自定义 HMAC 密钥（不设置则使用 `ENV_BOT_SECRET`） | `my_sign_secret` |
@@ -111,30 +116,24 @@
 
 ## 步骤 7：激活 Webhook
 
-部署完成后，在浏览器访问以下 URL 来激活机器人：
+部署完成后，在浏览器访问以下 URL 来激活机器人（仅更改前面的域名 ）：
 
 ```
 https://<你的 worker 域名>/registerWebhook
 ```
-
+例如： https://tgbot.qianqi.workers.dev/registerWebhook
 ---
 
 ## 可选：启用话题模式
 
 如果希望管理员在 Telegram 论坛话题里统一处理访客消息：
 
-1. 在 `Workers & Pages → Settings → Variables` 中设置 `GROUP_ID`（论坛群组 ID，如 `-1001234567890`）。
-2. 确保机器人在该群组是管理员，并拥有“管理话题”权限。
-3. 在 Telegram 中发送 `/menu`，点击「💬 转发模式」，切换为“话题转发”。
+1. 在 `Workers & Pages → 设置 → 变量和机密` 中设置 `GROUP_ID`（论坛群组 ID，如 `-1001234567890`）。
+2. 确保机器人在该群组是管理员，让拥有“管理话题”权限，并且群组要确保群组开启了话题功能。
+3. 在 Telegram 你的刚刚创建的bot中发送 `/menu`，点击「💬 转发模式」，切换为“话题转发”。
+4. 其实第7步完成应该会弹窗
 
 启用后，机器人会为每位访客自动创建话题，并把后续消息都发到对应的话题中。管理员在话题里回复即可把消息回传给访客。
-
-示例：
-```
-https://saferelay.yourname.workers.dev/registerWebhook
-```
-
-如果看到 `Ok`，说明部署成功！
 
 发送 `/start` 给你的机器人，确认可以收到机器人回复。
 
@@ -142,6 +141,7 @@ https://saferelay.yourname.workers.dev/registerWebhook
 
 ---
 
+## 前方的区域请自行探索，现在的功能已经够用了
 ## （可选）步骤 8：配置 Workers AI
 
 如需启用 AI 智能垃圾消息检测，请完成以下步骤：
