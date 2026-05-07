@@ -122,6 +122,7 @@
 https://<你的 worker 域名>/registerWebhook
 ```
 例如： `https://tgbot.qianqi.workers.dev/registerWebhook`
+
 ---
 
 ## 可选：启用话题模式
