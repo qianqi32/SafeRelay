@@ -1,3 +1,5 @@
-![后台页面](./picture/tgbot1.jpg)
-![后台页面](./picture/tgbot2.jpg)
-![后台页面](./picture/tgbot3.jpg)
+![后台页面](./图片/tgbot1.jpg)
+
+![后台页面](./图片/tgbot2.jpg)
+
+![后台页面](./图片/tgbot3.jpg)
