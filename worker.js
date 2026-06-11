@@ -57,7 +57,7 @@ const CONFIG = {
 
   // Workers AI 配置
   AI_SPAM_DETECTION_ENABLED: false,   // AI 垃圾检测开关（默认关闭）
-  AI_MODEL_ID: '@cf/meta/llama-2-7b-chat-int8',  // AI 模型
+  AI_MODEL_ID: '@cf/meta/llama-3.2-3b-instruct',  // AI 模型
   AI_CONFIDENCE_THRESHOLD: 0.7,       // AI 置信度阈值
   AI_RATE_LIMIT_PER_HOUR: 100,        // AI 每小时调用次数限制
 
@@ -4073,25 +4073,25 @@ async function generateMainMenu() {
   const aiConfig = await getAISpamDetectionConfig();
   const forwardMode = await getForwardMode();
 
-  const welcomeStatus = welcomeMsg ? '🟢' : '⚪️';
-  const autoReplyStatus = autoReplyMsg ? '🟢' : '⚪️';
-  const unionBanStatus = (unionBanEnabled === '1' || unionBanEnabled === 'true') ? '🟢' : '🔴';
-  const spamFilterStatus = spamFilterEnabled ? '🟢' : '🔴';
-  const aiStatus = aiConfig.enabled ? '🟢' : '⚪️';
+  const spamFilterIcon = spamFilterEnabled ? '🟢' : '🔴';
+  const aiIcon = aiConfig.enabled ? '🟢' : '🔴';
+  const unionBanIcon = (unionBanEnabled === '1' || unionBanEnabled === 'true') ? '🟢' : '🔴';
+  const welcomeIcon = welcomeMsg ? '🟢' : '⚪️';
+  const autoReplyIcon = autoReplyMsg ? '🟢' : '⚪️';
   const forwardStatus = forwardMode === FORWARD_MODES.TOPIC ? '💬 话题' : '📥 私聊';
 
   const text = `🛠 <b>SafeRelay 管理面板</b>
 
-  📊 <b>当前配置:</b>
-  🔸 验证模式：${getVerifyModeName(verifyMode)}
-  🔸 垃圾过滤 ${spamFilterStatus}
-  🔸 AI 检测 ${aiStatus}
-  🔸 联合封禁 ${unionBanStatus}
-  🔸 欢迎消息 ${welcomeStatus}
-  🔸 自动回复 ${autoReplyStatus}
-  🔸 转发模式 ${forwardStatus}
+📊 <b>当前配置:</b>
+🔸 ${verifyMode === 'turnstile' ? '☁️' : '📝'} 验证模式：${getVerifyModeName(verifyMode)}
+🔸 ${spamFilterIcon} 垃圾过滤：${spamFilterEnabled ? '已开启' : '已关闭'}
+🔸 ${aiIcon} AI 检测：${aiConfig.enabled ? '已开启' : '已关闭'}
+🔸 ${unionBanIcon} 联合封禁：${(unionBanEnabled === '1' || unionBanEnabled === 'true') ? '已开启' : '已关闭'}
+🔸 ${welcomeIcon} 欢迎消息：${welcomeMsg ? '已设置' : '未设置'}
+🔸 ${autoReplyIcon} 自动回复：${autoReplyMsg ? '已设置' : '未设置'}
+🔸 ${forwardStatus} 转发模式：${forwardStatus}
 
-  👇 点击下方按钮进入设置`;
+👇 点击下方按钮进入设置`;
 
   const keyboard = {
     inline_keyboard: [
@@ -4591,6 +4591,18 @@ async function handleAdminCallback(callbackQuery) {
     return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id });
   }
 
+  if (data === 'back_to_ai_menu') {
+    const menu = await generateAISpamSubmenu();
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id });
+  }
+
   // 主菜单 - 进入子菜单
   if (data === 'submenu_verify') {
     const menu = await generateVerifySubmenu();
@@ -4926,6 +4938,45 @@ async function handleAdminCallback(callbackQuery) {
     return requestTelegram('answerCallbackQuery', {
       callback_query_id: callbackQuery.id,
       text: !aiConfig.enabled ? 'AI 检测已开启' : 'AI 检测已关闭'
+    });
+  }
+
+  // AI 检测 - 查看使用统计
+  if (data === 'ai_stats') {
+    const now = Date.now();
+    const rateLimit = await checkAIRateLimit();
+    const used = CONFIG.AI_RATE_LIMIT_PER_HOUR - rateLimit.remaining;
+    return requestTelegram('answerCallbackQuery', {
+      callback_query_id: callbackQuery.id,
+      text: `📊 AI 使用统计\n本小时已用: ${used}/${CONFIG.AI_RATE_LIMIT_PER_HOUR}\n剩余: ${rateLimit.remaining}\n重置: ${rateLimit.resetAfter || Math.ceil(3600 - (now % 3600000) / 1000)}秒后`,
+      show_alert: true
+    });
+  }
+
+  // AI 检测 - 调整置信度
+  if (data === 'ai_confidence') {
+    const text = `⚙️ <b>调整 AI 置信度</b>
+
+当前阈值：<code>${(await getAISpamDetectionConfig()).confidenceThreshold || 0.7}</code>
+
+请发送一个新数值（0.5 ~ 0.95）：
+• 越高越严格（减少误判）
+• 越低越宽松（减少漏判）
+• 建议范围：0.6 ~ 0.8
+
+发送 <code>/cancel</code> 取消`;
+
+    await KV.put(`ai_confidence_wait:${chatId}`, '1', { expirationTtl: 120 });
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '◀️ 返回 AI 菜单', callback_data: 'back_to_ai_menu' }]] }
+    });
+    return requestTelegram('answerCallbackQuery', {
+      callback_query_id: callbackQuery.id,
+      text: '请输入新的置信度阈值'
     });
   }
 
@@ -5342,6 +5393,41 @@ async function handleAdminMessage(message) {
 
   // 【关键词管理】检查是否允许添加关键词（只在 General 话题或私聊中）
   const canManageKeywords = !isInTopic || isInGeneralTopic;
+
+  // 【AI 置信度配置】检查是否在等待输入置信度阈值
+  const aiConfidenceWaitKey = `ai_confidence_wait:${adminChatId}`;
+  const isWaitingForAIConfidence = await KV.get(aiConfidenceWaitKey);
+  if (isWaitingForAIConfidence) {
+    const replyTarget = getReplyTarget();
+    await KV.delete(aiConfidenceWaitKey);
+
+    if (text.toLowerCase() === '/cancel' || text.toLowerCase() === '取消') {
+      return sendMessage({
+        ...replyTarget,
+        text: '❌ 已取消调整置信度'
+      });
+    }
+
+    const newThreshold = parseFloat(text);
+    if (isNaN(newThreshold) || newThreshold < 0.5 || newThreshold > 0.95) {
+      return sendMessage({
+        ...replyTarget,
+        text: '⚠️ 请输入有效的数值（0.5 ~ 0.95），例如：0.75'
+      });
+    }
+
+    const aiConfig = await getAISpamDetectionConfig();
+    await setAISpamDetectionConfig({
+      enabled: aiConfig.enabled,
+      confidenceThreshold: newThreshold
+    });
+
+    return sendMessage({
+      ...replyTarget,
+      text: `✅ AI 置信度已更新为 <code>${newThreshold}</code>\n\n• 越高越严格（减少误判）\n• 越低越宽松（减少漏判）`,
+      parse_mode: 'HTML'
+    });
+  }
 
   // 【垃圾话题配置】检查是否在配置垃圾话题 ID 的等待状态
   const spamTopicWaitKey = `spam_topic_config_wait:${adminChatId}`;
