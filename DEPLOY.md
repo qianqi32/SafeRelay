@@ -123,7 +123,8 @@
 |             变量              |  类型  | 说明                                                         |             示例              |
 | :---------------------------: | :----: | :----------------------------------------------------------- | :---------------------------: |
 |          `ADMIN_IDS`          |  文本  | 多管理员 ID 列表，用英文逗号分隔；不能代替必填变量 `ENV_ADMIN_UID` |         `111,222,333`         |
-|     `WORKERS_AI_ENABLED`      |  文本  | 是否启用 Workers AI 垃圾消息检测；填 `true` 表示启用        |            `true`             |
+|     `CF_ACCOUNT_ID`      |  密钥  | Cloudflare Account ID（启用 AI 检测时需要）                  |    `abc123...`    |
+|      `CF_AI_TOKEN`       |  密钥  | Cloudflare API Token，权限选 Workers AI → Run（启用 AI 检测时需要） | `sk-abc123...` |
 | `TURNSTILE_ALLOWED_HOSTNAMES` |  文本  | Turnstile 允许验证的域名白名单，多个域名用英文逗号或空格分隔 | `tgbot.example.workers.dev` |
 |      `TURNSTILE_ACTION`       |  文本  | Turnstile 验证动作名称，通常保持默认即可                    |          `tg_verify`          |
 |    `VERIFY_SIGNING_SECRET`    |  密钥  | 验证链接签名密钥；不设置时默认使用 `ENV_BOT_SECRET`          |       `my_sign_secret`        |
@@ -165,34 +166,43 @@ https://<你的 worker 域名>/registerWebhook
 
 如需启用 AI 智能垃圾消息检测，请完成以下步骤：
 
-### 1. 开通 Workers AI
+### 1. 获取 Cloudflare Account ID
 
 1. 前往 [Cloudflare Dashboard](https://dash.cloudflare.com/)
-2. 导航到 **Workers & Pages** → **AI**
-3. 点击 **Enable Workers AI**
-4. 绑定支付方式（Workers AI 有免费额度）
+2. 右侧顶部找到你的 **Account ID**，直接复制
 
-### 2. 确认环境变量
+### 2. 创建 API Token
 
-确保已设置环境变量：
+1. 右上角头像 → **My Profile** → **API Tokens**
+2. 点击 **Create Token** → **Create Custom Token**
+3. 配置权限：
+   - Permissions: `Account` → `Workers AI` → `Run`
+   - Account Resources: 选择你的账户
+4. 点击 **Continue to summary** → **Create Token**
+5. 复制生成的 Token（只显示一次）
+
+### 3. 设置环境变量
+
+添加以下两个**密钥**类型变量：
+
 ```
-WORKERS_AI_ENABLED=true
+CF_ACCOUNT_ID = 第一步的 Account ID
+CF_AI_TOKEN   = 第二步的 API Token
 ```
 
-### 3. 启用 AI 检测
+### 4. 启用 AI 检测
 
 1. 发送 `/menu` 打开管理面板
-2. 点击 **垃圾消息过滤**
-3. 点击 **AI 智能检测**
-4. 开启 AI 检测并设置阈值（推荐 0.7-0.8）
+2. 点击 **🤖 AI 检测**
+3. 点击 **🟢 开启 AI 检测**
+4. 可通过 **⚙️ 调整置信度** 设置阈值（推荐 0.7）
 
-### 4. 监控 AI 使用量
+### 5. 监控 AI 使用量
 
-- 发送 `/spamstats` 查看 AI 检测统计
-- 在 Cloudflare Dashboard → Workers → AI 查看使用量
-- 免费额度：每小时 100 次调用
+- 管理面板 → 🤖 AI 检测 → **📊 查看使用统计**
+- 在 [Cloudflare AI Dashboard](https://dash.cloudflare.com/ai/workers-ai) 查看 Workers AI 总用量
 
-> ⚠️ **注意**：Workers AI 为付费服务，但免费额度足够个人使用。如超出免费额度，会产生额外费用。
+> 💡 **免费额度**：Workers AI 每天提供 10,000 Neurons 免费额度（短文本分类每次约消耗 1-2 Neurons），个人使用通常不会超出。
 
 ---
 
@@ -239,7 +249,7 @@ GROUP_ID=-1001234567890
 ### 功能选项
 4. **联合封禁**：使用第三方服务查询，会共享用户 ID，请根据隐私需求决定是否开启。
 5. **消息映射过期**：消息转发映射关系保存 48 小时，超过后无法回复旧消息。
-6. **Workers AI**：为可选功能，启用后会产生 AI 调用费用（免费额度内免费）。
+6. **Workers AI**：为可选功能，需设置 `CF_ACCOUNT_ID` 和 `CF_AI_TOKEN` 环境变量。使用 Llama 3.2 3B 模型，每天 10,000 Neurons 免费额度。
 7. **论坛群组**：仅在使用 Telegram 论坛群组时需要设置 `GROUP_ID`。
 
 ### 安全配置
@@ -274,16 +284,16 @@ A: 不需要，Webhook 只需激活一次。
 ### Workers AI 相关
 
 **Q: Workers AI 收费吗？**  
-A: Workers AI 是付费服务，但提供充足的免费额度。个人使用通常不会超出免费额度。
+A: Workers AI 每天提供 10,000 Neurons 免费额度，短文本分类每次约消耗 1-2 Neurons，个人使用通常不会超出免费额度。
 
 **Q: AI 检测不生效怎么办？**  
 A: 请检查：
-1. 是否设置 `WORKERS_AI_ENABLED=true`
-2. 是否在管理面板中启用了 AI 检测
-3. 查看日志是否有 AI API 调用错误
+1. 是否设置了 `CF_ACCOUNT_ID` 和 `CF_AI_TOKEN` 两个环境变量
+2. 是否在管理面板（🤖 AI 检测）中启用了 AI 检测
+3. 在 Cloudflare Worker Logs 中搜索 `ai_api_call_failed` 或 `ai_detection_failed` 排查错误
 
 **Q: 如何调整 AI 检测阈值？**  
-A: 发送 `/menu` → 垃圾消息过滤 → AI 智能检测 → 调整阈值（推荐 0.7-0.8）
+A: 发送 `/menu` → 🤖 AI 检测 → ⚙️ 调整置信度 → 输入数值（推荐 0.7）
 
 ### 论坛群组相关
 
