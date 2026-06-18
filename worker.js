@@ -3571,22 +3571,37 @@ async function deleteForwardedResultMessages(result, target) {
 
 // 设置 Telegram 命令列表
 async function setBotCommands() {
+  // ========== 普通用户命令（默认范围） ==========
+  const userCommands = [
+    { command: 'start', description: '开始验证 / 开始对话' },
+    { command: 'help', description: '查看使用说明' },
+  ];
+
+  // ========== 管理员命令 ==========
   const adminCommands = [
-    { command: 'help', description: '显示帮助' },
-    { command: 'menu', description: '管理菜单' },
+    { command: 'menu', description: '打开管理面板' },
+    { command: 'help', description: '查看管理员帮助' },
     { command: 'ban', description: '封禁用户' },
     { command: 'unban', description: '解除封禁' },
-    { command: 'reset', description: '重置验证' },
-    { command: 'trust', description: '信任用户' },
+    { command: 'trust', description: '信任用户（白名单）' },
     { command: 'untrust', description: '取消信任' },
-    { command: 'broadcast', description: '广播消息' },
-    { command: 'bcancel', description: '取消广播' },
-    { command: 'welcome', description: '欢迎消息' },
-    { command: 'autoreply', description: '自动回复' }
+    { command: 'reset', description: '重置用户验证状态' },
+    { command: 'broadcast', description: '广播消息给所有用户' },
+    { command: 'welcome', description: '设置欢迎消息' },
+    { command: 'autoreply', description: '设置自动回复' },
+    { command: 'cleanup', description: '清理失效话题映射' },
+    { command: 'cachestats', description: '查看缓存统计信息' },
   ];
 
   try {
-    // 为管理员设置命令列表
+    // 1. 清除旧残留 → 设置普通用户默认命令
+    await requestTelegram('setMyCommands', {
+      commands: userCommands,
+      scope: { type: 'default' }
+    });
+    Logger.info('user_commands_set', { count: userCommands.length });
+
+    // 2. 为每个管理员单独设置管理命令
     const adminTargets = ADMIN_ID_LIST.length ? ADMIN_ID_LIST : (ADMIN_UID ? [ADMIN_UID] : []);
     for (const adminId of adminTargets) {
       await requestTelegram('setMyCommands', {
@@ -3594,9 +3609,9 @@ async function setBotCommands() {
         scope: { type: 'chat', chat_id: adminId }
       });
     }
-    Logger.info('admin_commands_set');
+    Logger.info('admin_commands_set', { admins: adminTargets.length, commands: adminCommands.length });
   } catch (e) {
-    Logger.error('set_admin_commands_failed', e);
+    Logger.error('set_commands_failed', e);
   }
 }
 
@@ -4023,19 +4038,21 @@ async function getVerifiedUsersPaged(page = 1, pageSize = 10, filter = 'all') {
     // 获取每个用户的详细信息并过滤
     const userDetails = [];
     for (const [userId, userName] of allUsers) {
-      const blocked = await isBlockedCached(userId);
-      const whitelisted = await isWhitelisted(userId);
+      const [blocked, whitelisted] = await Promise.all([
+        isBlockedCached(userId),
+        isWhitelisted(userId)
+      ]);
 
       const user = {
         id: userId,
         name: userName || 'Unknown',
-        blocked: blocked === 'true',
-        whitelisted: whitelisted
+        blocked: !!blocked,
+        whitelisted: !!whitelisted
       };
 
       // 应用过滤
-      if (filter === 'whitelisted' && !whitelisted) continue;
-      if (filter === 'blocked' && !blocked) continue;
+      if (filter === 'whitelisted' && !user.whitelisted) continue;
+      if (filter === 'blocked' && !user.blocked) continue;
 
       userDetails.push(user);
     }
@@ -4446,108 +4463,170 @@ async function generateStatsSubmenu() {
 // 生成用户管理子菜单
 async function generateUsersSubmenu(page = 1, filter = 'all') {
   const result = await getVerifiedUsersPaged(page, 10, filter);
-
-  // 获取各类用户数量统计
   const stats = await getUserStats();
 
+  const filterLabel = { all: '全部用户', whitelisted: '信任用户', blocked: '拉黑用户' }[filter] || '';
+
   if (result.total === 0) {
-    const filterText = getFilterText(filter);
-    const text = `👥 <b>用户管理</b> <code>${filterText}</code>
+    const text = `👥 <b>用户管理</b> · ${filterLabel}
 
 📊 全部 ${stats.total} | ⭐信任 ${stats.whitelisted} | 🚫拉黑 ${stats.blocked}
 
-暂无${filterText}用户。`;
+暂无匹配用户。`;
 
-    // 过滤按钮（当前选中的显示为 ✅）
-    const filterButtonsEmpty = [
-      { text: (filter === 'all' ? '✅ ' : '') + '👁 全部', callback_data: 'users_filter:all' },
-      { text: (filter === 'whitelisted' ? '✅ ' : '') + '⭐ 信任', callback_data: 'users_filter:whitelisted' },
-      { text: (filter === 'blocked' ? '✅ ' : '') + '🚫 拉黑', callback_data: 'users_filter:blocked' }
+    const filterButtons = [
+      { text: (filter === 'all' ? '✅ ' : '') + '全部', callback_data: 'users_filter:all' },
+      { text: (filter === 'whitelisted' ? '✅ ' : '') + '⭐信任', callback_data: 'users_filter:whitelisted' },
+      { text: (filter === 'blocked' ? '✅ ' : '') + '🚫拉黑', callback_data: 'users_filter:blocked' }
     ];
 
-    const keyboard = {
-      inline_keyboard: [
-        filterButtonsEmpty,
-        [{ text: '🔄 刷新', callback_data: `refresh_users:${page}:${filter}` }],
-        [{ text: '◀️ 返回主菜单', callback_data: 'back_to_main' }]
-      ]
+    return {
+      text,
+      reply_markup: {
+        inline_keyboard: [
+          filterButtons,
+          [{ text: '🔄 刷新', callback_data: `refresh_users:${page}:${filter}` }],
+          [{ text: '◀️ 返回主菜单', callback_data: 'back_to_main' }]
+        ]
+      }
     };
-
-    return { text, reply_markup: keyboard };
   }
 
-  // 构建用户列表（使用缓存的用户资料）
+  // 构建用户列表 — 统一用名字显示，无资料的退回到 ID
   let userList = '';
+  const userButtons = [];
+  let idx = (page - 1) * 10 + 1;
+
   for (const user of result.users) {
     const status = user.blocked ? '🚫' : (user.whitelisted ? '⭐' : '•');
 
-    // 尝试获取缓存的用户资料
     const profile = await getUserProfile(user.id);
-    let displayInfo = '';
+    let displayName = '';
+    let usernameStr = '';
 
     if (profile) {
-      // 使用缓存的资料构建显示信息
-      const nameParts = [];
-      if (profile.first_name) nameParts.push(profile.first_name);
-      if (profile.last_name) nameParts.push(profile.last_name);
-
-      if (nameParts.length > 0) {
-        displayInfo = ` (${escapeHtml(nameParts.join(' '))})`;
-      }
-
-      // 如果有用户名，也显示
-      if (profile.username) {
-        displayInfo += ` @${escapeHtml(profile.username)}`;
-      }
-    } else if (user.name !== 'Unknown') {
-      // 回退到已验证列表中的名称
-      displayInfo = ` (${escapeHtml(user.name)})`;
+      displayName = [profile.first_name, profile.last_name].filter(Boolean).join(' ');
+      if (!displayName) displayName = profile.username || '';
+      if (profile.username && displayName !== profile.username) usernameStr = `@${profile.username}`;
+    } else if (user.name && user.name !== 'Unknown') {
+      displayName = user.name;
     }
 
-    userList += `${status} <code>${user.id}</code>${displayInfo}\n`;
+    if (!displayName) displayName = user.id;
+
+    // 列表文本行
+    let line = `${idx}. ${status} <b>${escapeHtml(displayName)}</b>`;
+    if (usernameStr) line += `  ${escapeHtml(usernameStr)}`;
+    line += `\n   UID: <code>${user.id}</code>`;
+    if (user.whitelisted) line += ` · ⭐信任`;
+    if (user.blocked) line += ` · 🚫拉黑`;
+    line += '\n';
+    userList += line;
+
+    // 收集所有用户按钮 — 序号 + 状态图标
+    let btnIcon = '';
+    if (user.whitelisted) btnIcon = '⭐';
+    if (user.blocked) btnIcon = '🚫';
+    userButtons.push({
+      text: `${idx}${btnIcon}`,
+      callback_data: `user_menu:${user.id}:${page}:${filter}`
+    });
+
+    idx++;
   }
 
-  const filterText = getFilterText(filter);
-  const text = `👥 <b>用户管理</b> <code>${filterText}</code>
+  // 每行 5 个序号按钮
+  const userButtonRows = [];
+  for (let i = 0; i < userButtons.length; i += 5) {
+    userButtonRows.push(userButtons.slice(i, i + 5));
+  }
 
-📊 全部 ${stats.total} | ⭐信任 ${stats.whitelisted} | 🚫拉黑 ${stats.blocked}
-第 ${result.page}/${result.totalPages} 页
+  const text = `👥 <b>用户管理</b> · ${filterLabel}
 
-${userList}`;
+📊 全部 ${stats.total} | ⭐信任 ${stats.whitelisted} | 🚫拉黑 ${stats.blocked}  第 ${result.page}/${result.totalPages} 页
 
-  // 构建分页按钮
+${userList}
+💡 点击下方序号按钮即可管理对应用户`;
+
+  // 分页
   const paginationButtons = [];
   if (result.page > 1) {
-    paginationButtons.push({ text: '◀️', callback_data: `users_page:${result.page - 1}:${filter}` });
+    paginationButtons.push({ text: '◀️ 上页', callback_data: `users_page:${result.page - 1}:${filter}` });
   }
-  paginationButtons.push({ text: `${result.page}/${result.totalPages}`, callback_data: 'noop' });
   if (result.page < result.totalPages) {
-    paginationButtons.push({ text: '▶️', callback_data: `users_page:${result.page + 1}:${filter}` });
+    paginationButtons.push({ text: '下页 ▶️', callback_data: `users_page:${result.page + 1}:${filter}` });
   }
 
-  // 过滤按钮（当前选中的显示为 ✅）
+  // 过滤
   const filterButtons = [
     { text: (filter === 'all' ? '✅ ' : '') + '全部', callback_data: 'users_filter:all' },
-    { text: (filter === 'whitelisted' ? '✅ ' : '') + '信任', callback_data: 'users_filter:whitelisted' },
-    { text: (filter === 'blocked' ? '✅ ' : '') + '拉黑', callback_data: 'users_filter:blocked' }
+    { text: (filter === 'whitelisted' ? '✅ ' : '') + '⭐信任', callback_data: 'users_filter:whitelisted' },
+    { text: (filter === 'blocked' ? '✅ ' : '') + '🚫拉黑', callback_data: 'users_filter:blocked' }
   ];
 
-  const keyboard = {
-    inline_keyboard: [
-      paginationButtons,
-      filterButtons,
-      [{ text: '🔄 刷新', callback_data: `refresh_users:${result.page}:${filter}` }],
-      [{ text: '◀️ 返回主菜单', callback_data: 'back_to_main' }]
-    ]
-  };
+  const keyboardRows = [filterButtons];
+  if (paginationButtons.length) keyboardRows.push(paginationButtons);
+  keyboardRows.push(...userButtonRows);
+  keyboardRows.push([
+    { text: '🔄 刷新', callback_data: `refresh_users:${result.page}:${filter}` },
+    { text: '◀️ 返回主菜单', callback_data: 'back_to_main' }
+  ]);
 
-  return { text, reply_markup: keyboard };
+  return { text, reply_markup: { inline_keyboard: keyboardRows } };
 }
 
-// 获取过滤文本
-function getFilterText(filter) {
-  const map = { all: '', whitelisted: '信任', blocked: '拉黑' };
-  return map[filter] || '';
+// 生成单个用户的操作子菜单
+async function generateUserActionSubmenu(userId, page, filter) {
+  const [whitelisted, blocked, profile] = await Promise.all([
+    isWhitelisted(userId),
+    isBlockedCached(userId),
+    getUserProfile(userId)
+  ]);
+
+  let displayName = '';
+  let usernameStr = '';
+  if (profile) {
+    displayName = [profile.first_name, profile.last_name].filter(Boolean).join(' ');
+    if (!displayName) displayName = profile.username || '';
+    if (profile.username && displayName !== profile.username) usernameStr = `@${profile.username}`;
+  }
+  if (!displayName) displayName = userId;
+
+  const statusIcon = blocked ? '🚫' : (whitelisted ? '⭐' : '👤');
+  const statusText = blocked ? '已拉黑' : (whitelisted ? '已信任' : '普通用户');
+
+  let text = `👤 <b>${escapeHtml(displayName)}</b>
+═══════════════
+
+🆔 UID: <code>${userId}</code>`;
+  if (usernameStr) text += `\n📎 ${escapeHtml(usernameStr)}`;
+  text += `\n📌 状态：${statusIcon} ${statusText}
+
+请选择操作：`;
+
+  const actionButtons = [];
+
+  if (whitelisted) {
+    actionButtons.push({ text: '❌ 取消信任', callback_data: `user_untrust:${userId}:${page}:${filter}` });
+  } else {
+    actionButtons.push({ text: '⭐ 信任', callback_data: `user_trust:${userId}:${page}:${filter}` });
+  }
+
+  if (blocked) {
+    actionButtons.push({ text: '✅ 解封', callback_data: `user_unblock:${userId}:${page}:${filter}` });
+  } else {
+    actionButtons.push({ text: '🚫 拉黑', callback_data: `user_block:${userId}:${page}:${filter}` });
+  }
+
+  return {
+    text,
+    reply_markup: {
+      inline_keyboard: [
+        actionButtons,
+        [{ text: '← 返回用户列表', callback_data: `users_page:${page}:${filter}` }]
+      ]
+    }
+  };
 }
 
 // 获取用户统计
@@ -4577,6 +4656,11 @@ async function handleAdminCallback(callbackQuery) {
   const chatId = callbackQuery.message.chat.id;
   const messageId = callbackQuery.message.message_id;
   const adminChatId = String(callbackQuery.from.id); // 使用回调用户的 ID
+
+  // 空操作（页码显示按钮等）
+  if (data === 'noop') {
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id });
+  }
 
   // 返回主菜单
   if (data === 'back_to_main') {
@@ -4882,6 +4966,98 @@ async function handleAdminCallback(callbackQuery) {
     return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id, text: '已刷新' });
   }
 
+  // 用户管理 - 进入用户操作子菜单
+  if (data.startsWith('user_menu:')) {
+    const parts = data.split(':');
+    const userId = parts[1];
+    const page = parseInt(parts[2]) || 1;
+    const filter = parts[3] || 'all';
+    const menu = await generateUserActionSubmenu(userId, page, filter);
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id });
+  }
+
+  // 用户管理 - 信任用户
+  if (data.startsWith('user_trust:')) {
+    const parts = data.split(':');
+    const userId = parts[1];
+    const page = parseInt(parts[2]) || 1;
+    const filter = parts[3] || 'all';
+    await addToWhitelist(userId);
+    const menu = await generateUsersSubmenu(page, filter);
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id, text: `已信任用户 ${userId}` });
+  }
+
+  // 用户管理 - 取消信任用户
+  if (data.startsWith('user_untrust:')) {
+    const parts = data.split(':');
+    const userId = parts[1];
+    const page = parseInt(parts[2]) || 1;
+    const filter = parts[3] || 'all';
+    await removeFromWhitelist(userId);
+    const menu = await generateUsersSubmenu(page, filter);
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id, text: `已取消信任用户 ${userId}` });
+  }
+
+  // 用户管理 - 拉黑用户
+  if (data.startsWith('user_block:')) {
+    const parts = data.split(':');
+    const userId = parts[1];
+    const page = parseInt(parts[2]) || 1;
+    const filter = parts[3] || 'all';
+    await KV.put('blocked-' + userId, 'true');
+    await invalidateBlockedCache(userId);
+    await removeVerifiedUser(userId);
+    const menu = await generateUsersSubmenu(page, filter);
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id, text: `已拉黑用户 ${userId}` });
+  }
+
+  // 用户管理 - 解封用户
+  if (data.startsWith('user_unblock:')) {
+    const parts = data.split(':');
+    const userId = parts[1];
+    const page = parseInt(parts[2]) || 1;
+    const filter = parts[3] || 'all';
+    await KV.delete('blocked-' + userId);
+    await invalidateBlockedCache(userId);
+    const menu = await generateUsersSubmenu(page, filter);
+    await requestTelegram('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: menu.text,
+      parse_mode: 'HTML',
+      reply_markup: menu.reply_markup
+    });
+    return requestTelegram('answerCallbackQuery', { callback_query_id: callbackQuery.id, text: `已解封用户 ${userId}` });
+  }
+
   // 垃圾过滤 - 切换状态
   if (data === 'toggle_spam_filter') {
     const isEnabled = await getSpamFilterEnabled();
@@ -5064,7 +5240,7 @@ async function handleAdminCallback(callbackQuery) {
       });
       return requestTelegram('answerCallbackQuery', {
         callback_query_id: callbackQuery.id,
-        text: `✅ 话题已创建，ID: <code>${topicId}</code>`
+        text: `✅ 话题已创建，ID: ${topicId}`
       });
     } else {
       return requestTelegram('answerCallbackQuery', {
@@ -5105,7 +5281,7 @@ async function handleAdminCallback(callbackQuery) {
       });
       return requestTelegram('answerCallbackQuery', {
         callback_query_id: callbackQuery.id,
-        text: `✅ 话题已重新创建，ID: <code>${topicId}</code>`
+        text: `✅ 话题已重新创建，ID: ${topicId}`
       });
     } else {
       return requestTelegram('answerCallbackQuery', {
@@ -5356,7 +5532,7 @@ function escapeHtml(unsafe) {
 
 // 处理管理员消息
 async function handleAdminMessage(message) {
-  const text = (message.text || '').trim();
+  let text = (message.text || '').trim();
   const reply = message.reply_to_message;
   const contextChatId = message.chat?.id ? String(message.chat.id) : null;
   const senderId = message.from ? String(message.from.id) : null;
@@ -5490,7 +5666,8 @@ async function handleAdminMessage(message) {
 
         return sendMessage({
           ...replyTarget,
-          text: `✅ 垃圾话题已自动创建，ID: <code>${topicId}</code>\n\n请在菜单中开启垃圾话题功能`
+          text: `✅ 垃圾话题已自动创建，ID: <code>${topicId}</code>\n\n请在菜单中开启垃圾话题功能`,
+          parse_mode: 'HTML'
         });
       } else {
         return sendMessage({
@@ -5534,13 +5711,14 @@ async function handleAdminMessage(message) {
 
     return sendMessage({
       ...replyTarget,
-      text: `✅ 垃圾话题 ID 已设置：<code>${topicId}</code>\n\n请在菜单中开启垃圾话题功能`
+      text: `✅ 垃圾话题 ID 已设置：<code>${topicId}</code>\n\n请在菜单中开启垃圾话题功能`,
+      parse_mode: 'HTML'
     });
   }
 
   // 【修复】检查是否以 / 开头但不是有效命令
   // 如果是无效命令且是回复消息，防止转发给用户
-  const validCommands = ['/help', '/menu', '/welcome', '/autoreply', '/ban', '/unban', '/reset', '/trust', '/untrust', '/broadcast', '/bcancel', '/restore'];
+  const validCommands = ['/help', '/menu', '/welcome', '/autoreply', '/ban', '/unban', '/reset', '/trust', '/untrust', '/broadcast', '/bcancel', '/restore', '/start'];
   const isValidCommand = validCommands.some(cmd => text === cmd || text.startsWith(cmd + ' '));
   const isCommandLike = text.startsWith('/') && text.length > 1;
 
@@ -5550,6 +5728,13 @@ async function handleAdminMessage(message) {
   }
 
   // --- 管理指令区域 ---
+
+  // 指令：/start - 推送命令菜单 + 显示帮助
+  if (text === '/start') {
+    await setBotCommands();
+    // 直接 fall through 到 /help，显示完整的帮助信息
+    text = '/help'; // 让后续匹配命中 /help
+  }
 
   // 指令：/help - 显示帮助信息
   if (text === '/help') {
@@ -5756,7 +5941,7 @@ async function handleAdminMessage(message) {
       await KV.put('blocked-' + targetId, 'true');
       await invalidateBlockedCache(targetId);
       await removeVerifiedUser(targetId); // 从已验证列表移除
-      return sendMessage({ ...replyTarget, text: `🚫 用户 <code>${targetId}</code> 已被封禁。` });
+      return sendMessage({ ...replyTarget, text: `🚫 用户 <code>${targetId}</code> 已被封禁。`, parse_mode: 'HTML' });
     } else {
       return sendMessage({ ...replyTarget, text: '⚠️ 格式错误。\n请回复用户消息发送 /ban\n或发送 /ban 123456 (必须是数字 ID)' });
     }
@@ -5769,7 +5954,7 @@ async function handleAdminMessage(message) {
     if (targetId) {
       await KV.delete('blocked-' + targetId);
       await invalidateBlockedCache(targetId);
-      return sendMessage({ ...replyTarget, text: `✅ 用户 <code>${targetId}</code> 已解封。` });
+      return sendMessage({ ...replyTarget, text: `✅ 用户 <code>${targetId}</code> 已解封。`, parse_mode: 'HTML' });
     } else {
       return sendMessage({ ...replyTarget, text: '⚠️ 格式错误。\n请回复用户消息发送 /unban\n或发送 /unban 123456 (必须是数字 ID)' });
     }
@@ -5785,14 +5970,15 @@ async function handleAdminMessage(message) {
       if (isWhite) {
         return sendMessage({
           ...replyTarget,
-          text: `⚠️ 用户 <code>${targetId}</code> 在白名单中，无需验证即可发送消息。\n\n如需限制该用户，请先使用 /delwhite <code>${targetId}</code> 删除白名单。`
+          text: `⚠️ 用户 <code>${targetId}</code> 在白名单中，无需验证即可发送消息。\n\n如需限制该用户，请先使用 /delwhite <code>${targetId}</code> 删除白名单。`,
+          parse_mode: 'HTML'
         });
       }
 
       await KV.delete('verified-' + targetId);
       await invalidateCache('verified-' + targetId);
       await removeVerifiedUser(targetId); // 从已验证列表移除
-      return sendMessage({ ...replyTarget, text: `🔄 用户 <code>${targetId}</code> 验证状态已取消。` });
+      return sendMessage({ ...replyTarget, text: `🔄 用户 <code>${targetId}</code> 验证状态已取消。`, parse_mode: 'HTML' });
     } else {
       return sendMessage({ ...replyTarget, text: '⚠️ 格式错误。\n请回复用户消息发送 /reset\n或发送 /reset 123456 (必须是数字 ID)' });
     }
@@ -5805,7 +5991,8 @@ async function handleAdminMessage(message) {
     if (!broadcastMsg) {
       return sendMessage({
         ...replyTarget,
-        text: '⚠️ 格式错误。\n用法：/broadcast 消息内容\n\n支持 HTML 格式：\n<b>粗体</b> <i>斜体</i> <code>代码</code>'
+        text: '⚠️ 格式错误。\n用法：/broadcast 消息内容\n\n支持 HTML 格式：\n<b>粗体</b> <i>斜体</i> <code>代码</code>',
+        parse_mode: 'HTML'
       });
     }
 
@@ -5867,7 +6054,7 @@ async function handleAdminMessage(message) {
     const replyTarget = getReplyTarget();
     if (targetId) {
       await addToWhitelist(targetId);
-      return sendMessage({ ...replyTarget, text: `✅ 已信任用户 <code>${targetId}</code>` });
+      return sendMessage({ ...replyTarget, text: `✅ 已信任用户 <code>${targetId}</code>`, parse_mode: 'HTML' });
     } else {
       // 如果没有指定 ID，显示当前白名单状态
       return sendMessage({ ...replyTarget, text: '📋 请回复用户消息或发送 /trust 123456 来信任用户' });
@@ -5880,7 +6067,7 @@ async function handleAdminMessage(message) {
     const replyTarget = getReplyTarget();
     if (targetId) {
       await removeFromWhitelist(targetId);
-      return sendMessage({ ...replyTarget, text: `✅ 已取消信任用户 <code>${targetId}</code>` });
+      return sendMessage({ ...replyTarget, text: `✅ 已取消信任用户 <code>${targetId}</code>`, parse_mode: 'HTML' });
     } else {
       return sendMessage({ ...replyTarget, text: '📋 请回复用户消息或发送 /untrust 123456 来取消信任' });
     }

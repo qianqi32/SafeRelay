@@ -169,17 +169,19 @@ https://<你的 worker 域名>/registerWebhook
 ### 1. 获取 Cloudflare Account ID
 
 1. 前往 [Cloudflare Dashboard](https://dash.cloudflare.com/)
-2. 右侧顶部找到你的 **Account ID**，直接复制
+2. 进入 `Workers & Pages`，页面右侧即可看到 **Account ID**，点击复制
+3. 或者直接看浏览器地址栏：`https://dash.cloudflare.com/<这串就是 Account ID>`
 
 ### 2. 创建 API Token
 
 1. 右上角头像 → **My Profile** → **API Tokens**
-2. 点击 **Create Token** → **Create Custom Token**
-3. 配置权限：
-   - Permissions: `Account` → `Workers AI` → `Run`
+2. 点击 **Create Token**
+3. 找到 **Workers AI** 模版（或点 **Create Custom Token** 手动创建），点击 **使用模板**
+4. 如果手动创建，配置权限：
+   - Permissions: `Account` → `Workers AI` → `Edit`
    - Account Resources: 选择你的账户
-4. 点击 **Continue to summary** → **Create Token**
-5. 复制生成的 Token（只显示一次）
+5. 点击 **Continue to summary** → **Create Token**
+6. 复制生成的 Token（只显示一次）
 
 ### 3. 设置环境变量
 
