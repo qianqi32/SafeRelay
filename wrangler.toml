@@ -1,0 +1,17 @@
+name = "saferelay"
+main = "worker.js"
+compatibility_date = "2025-06-18"
+
+# 用户需要先创建 KV 命名空间，然后把 ID 填到这里
+[[kv_namespaces]]
+binding = "KV"
+id = ""
+
+# 🚨 敏感信息不要写在这里！通过 CF Dashboard 或 wrangler secret 设置
+# 部署完成后在 Web 控制台设置以下变量：
+#   ENV_BOT_TOKEN      — Telegram Bot Token（密钥类型）
+#   ENV_BOT_SECRET     — Webhook 密钥（密钥类型）
+#   ENV_ADMIN_UID      — 管理员 TG ID（纯文本）
+
+[vars]
+GROUP_ID = ""

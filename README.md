@@ -6,6 +6,10 @@
 
 [![JavaScript](https://img.shields.io/badge/JavaScript-ES6+-yellow?logo=javascript&logoColor=white)](https://developer.mozilla.org/zh-CN/docs/Web/JavaScript) [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare%20Workers-100K%2Fday-orange?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/) [![Telegram Bot](https://img.shields.io/badge/Telegram%20Bot-API%208.0+-blue?logo=telegram&logoColor=white)](https://core.telegram.org/bots/api) [![License](https://img.shields.io/badge/License-GPL--3.0-green)](LICENSE)
 
+<a href="https://workers.cloudflare.com/deploy?repoUrl=https://github.com/yrlight/SafeRelay">
+  <img src="https://img.shields.io/badge/🚀_一键部署到_Cloudflare_Workers-1DA1F2?style=for-the-badge&logo=cloudflare&logoColor=white" alt="Deploy to Cloudflare Workers">
+</a>
+
 </div>
 
 ---

@@ -54,54 +54,74 @@
 
 ---
 
-## 步骤 3：创建 Worker
+## 方案 A：一键部署（推荐）
 
-前往 `Cloudflare左边工具栏` → `计算` → `Workers & Pages`：
+点击 README.md 顶部的 🚀 一键部署按钮，按 Cloudflare 引导完成即可。
 
-1. 点击 `创建应用程序`
-2. 选择 `从 Hello World! 开始` 
-3. `Worker Name` 填写 `tgbot`（或其他你喜欢的名字）
-4. 点击 `部署`
-5. 在 Worker 页面复制你的 Worker 域名，例如 `tgbot.example.workers.dev`
+---
 
-### 回填 Turnstile 主机名
+## 方案 B：Wrangler CLI 部署
+
+项目已有 [wrangler.toml](./wrangler.toml)，一行命令部署：
+
+```bash
+# 1. 登录 Cloudflare
+npx wrangler login
+
+# 2. 创建 KV 并部署（会自动提示你绑定）
+npx wrangler kv:namespace create KV
+# → 复制返回的 ID，粘贴到 wrangler.toml 的 id = "" 中
+
+# 3. 设置密钥
+npx wrangler secret put ENV_BOT_TOKEN
+npx wrangler secret put ENV_BOT_SECRET
+npx wrangler secret put ENV_ADMIN_UID
+
+# 4. 部署
+npx wrangler deploy
+```
+
+部署完访问 `https://你的worker域名/registerWebhook` 激活。
+
+---
+
+## 方案 C：Dashboard 手动部署
+
+### 步骤 1：创建 Worker
+
+前往 `Cloudflare` → `计算` → `Workers & Pages`：
+
+1. 点击 `创建应用程序` → `从 Hello World! 开始`
+2. `Worker Name` 填 `tgbot`，点击 `部署`
+3. 复制你的 Worker 域名，例如 `tgbot.example.workers.dev`
+
+### 步骤 2：回填 Turnstile 主机名
 
 回到 `应用程序安全` → `Turnstile`：
 
-1. 找到刚才创建的小组件，点击最右侧的 **三个点** → **编辑**。
-2. 在 **主机名管理** 中添加刚才复制的 Worker 域名。
-3. 如果之前创建小组件时填写了临时/凑数主机名，请删除它。
-4. 点击页面最下方的 **更新** 按钮保存。
+1. 找到刚才创建的小组件 → 最右侧 **三个点** → **编辑**
+2. 在 **主机名管理** 中添加 Worker 域名
+3. 删除之前写的临时主机名，点击 **更新**
 
-> ⚠️ **重要**：Turnstile 的主机名必须和实际 Worker 域名一致，否则验证页面会加载失败或无法通过验证。
+> ⚠️ Turnstile 主机名必须和 Worker 域名一致，否则验证页面加载失败
 
----
+### 步骤 3：编辑代码
 
-## 步骤 4：编辑代码
+1. `Workers & Pages` → 你的 worker → 右上角 `编辑代码`
+2. 将 [worker.js](./worker.js) 全部内容粘贴覆盖
+3. 点击右上角 `部署`
 
-1. 进入 `Workers & Pages` → 刚才创建的 tgbot → 右上角`编辑代码`，手机可能在二级菜单里也是右上角
-2. 将 [worker.js](./worker.js) 的内容完整复制粘贴进去，覆盖原有代码
-3. 代码无需改动，所有密钥都会在下一步通过环境变量注入
-4. 点击右上角的 `部署`保存
+### 步骤 4：绑定 KV
 
----
+`Workers & Pages` → 你的 worker → `设置` → `绑定` → `添加绑定+`：
 
-## 步骤 5：绑定 KV
+- **变量名称**: `KV`（必须大写，代码写死了这个变量名）
+- **KV 命名空间**: 选择刚才创建的 `tgbot_kv`
+- 点击 `添加绑定`
 
-进入 `Workers & Pages` → 刚才创建的 tgbot → `绑定` ：
+### 步骤 5：设置环境变量
 
-1. 点击右边 `添加绑定+`
-2. 选择 `KV 命名空间`
-3. `添加绑定`
-4. `变量名称` **必须填写 `KV`**（必须大写，必须大写，必须大写，代码中写死了这个名字）
-5. `KV命名空间` 选择刚才创建的 `tgbot_kv`
-6. 点击 `添加绑定`
-
----
-
-## 步骤 6：设置环境变量
-
-进入 `Workers & Pages` → 刚才创建的 tgbot → `设置` → `变量和机密`：
+`Workers & Pages` → 你的 worker → `设置` → `变量和机密`：
 
 ### 必填变量
 
