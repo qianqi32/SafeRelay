@@ -54,13 +54,7 @@
 
 ---
 
-## 方案 A：一键部署（推荐）
-
-点击 README.md 顶部的 🚀 一键部署按钮，按 Cloudflare 引导完成即可。
-
----
-
-## 方案 B：Wrangler CLI 部署
+## 方案 A：Wrangler CLI 部署（推荐）
 
 项目已有 [wrangler.toml](./wrangler.toml)，一行命令部署：
 
@@ -85,7 +79,7 @@ npx wrangler deploy
 
 ---
 
-## 方案 C：Dashboard 手动部署
+## 方案 B：Dashboard 手动部署
 
 ### 步骤 1：创建 Worker
 
