@@ -6,9 +6,6 @@
 
 [![JavaScript](https://img.shields.io/badge/JavaScript-ES6+-yellow?logo=javascript&logoColor=white)](https://developer.mozilla.org/zh-CN/docs/Web/JavaScript) [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare%20Workers-100K%2Fday-orange?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/) [![Telegram Bot](https://img.shields.io/badge/Telegram%20Bot-API%208.0+-blue?logo=telegram&logoColor=white)](https://core.telegram.org/bots/api) [![License](https://img.shields.io/badge/License-GPL--3.0-green)](LICENSE)
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/qianqi32/SafeRelay)
-[![Deploy with Wrangler](https://img.shields.io/badge/部署-Wrangler_CLI-1DA1F2?style=for-the-badge&logo=cloudflare&logoColor=white)](./DEPLOY.md#%E6%96%B9%E6%A1%88-bwrangler-cli-%E9%83%A8%E7%BD%B2)
-
 </div>
 
 ---

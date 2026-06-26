@@ -4,24 +4,6 @@
 
 ---
 
-## 方案 A：通过 Cloudflare Dashboard 连接 GitHub 部署（推荐）
-
-不需要在本地安装任何工具，全程在网页上完成：
-
-1. 进入 [Cloudflare Dashboard](https://dash.cloudflare.com/) → **Workers & Pages**
-2. 点击 **创建应用程序** → **Pages** → **连接到 Git**
-3. 授权 GitHub 账号，选择你的仓库 `yrlight/SafeRelay`
-4. **框架预设** 选择 **None**（保持默认）
-5. **构建命令** 留空
-6. **构建输出目录** 留空
-7. 点击 **保存并部署** — Worker 会自动创建
-
-> ⚠️ 部署后还需要设置环境变量！往下看 **设置环境变量** 章节。
-
-**优点：** 之后每次 push 到 GitHub，Cloudflare 会自动重新部署。
-
----
-
 ## 前置准备
 
 部署前需要准备以下内容：
@@ -72,34 +54,9 @@
 
 ---
 
-## 方案 A：Wrangler CLI 部署（推荐）
+## 步骤 3：部署 Worker
 
-项目已有 [wrangler.toml](./wrangler.toml)，一行命令部署：
-
-```bash
-# 1. 登录 Cloudflare
-npx wrangler login
-
-# 2. 创建 KV 并部署（会自动提示你绑定）
-npx wrangler kv:namespace create KV
-# → 复制返回的 ID，粘贴到 wrangler.toml 的 id = "" 中
-
-# 3. 设置密钥
-npx wrangler secret put ENV_BOT_TOKEN
-npx wrangler secret put ENV_BOT_SECRET
-npx wrangler secret put ENV_ADMIN_UID
-
-# 4. 部署
-npx wrangler deploy
-```
-
-部署完访问 `https://你的worker域名/registerWebhook` 激活。
-
----
-
-## 方案 B：Dashboard 手动部署
-
-### 步骤 1：创建 Worker
+### 步骤 3.1：创建 Worker
 
 前往 `Cloudflare` → `计算` → `Workers & Pages`：
 
@@ -107,7 +64,7 @@ npx wrangler deploy
 2. `Worker Name` 填 `tgbot`，点击 `部署`
 3. 复制你的 Worker 域名，例如 `tgbot.example.workers.dev`
 
-### 步骤 2：回填 Turnstile 主机名
+### 步骤 3.2：回填 Turnstile 主机名
 
 回到 `应用程序安全` → `Turnstile`：
 
@@ -117,13 +74,13 @@ npx wrangler deploy
 
 > ⚠️ Turnstile 主机名必须和 Worker 域名一致，否则验证页面加载失败
 
-### 步骤 3：编辑代码
+### 步骤 3.3：编辑代码
 
 1. `Workers & Pages` → 你的 worker → 右上角 `编辑代码`
 2. 将 [worker.js](./worker.js) 全部内容粘贴覆盖
 3. 点击右上角 `部署`
 
-### 步骤 4：绑定 KV
+### 步骤 3.4：绑定 KV
 
 `Workers & Pages` → 你的 worker → `设置` → `绑定` → `添加绑定+`：
 
@@ -131,7 +88,7 @@ npx wrangler deploy
 - **KV 命名空间**: 选择刚才创建的 `tgbot_kv`
 - 点击 `添加绑定`
 
-### 步骤 5：设置环境变量
+### 步骤 3.5：设置环境变量
 
 `Workers & Pages` → 你的 worker → `设置` → `变量和机密`：
 
@@ -165,7 +122,7 @@ npx wrangler deploy
 
 ---
 
-## 步骤 7：激活 Webhook
+## 步骤 4：激活 Webhook
 
 部署完成后，在浏览器访问以下 URL 来激活机器人（仅更改前面的域名 ）：
 
@@ -183,7 +140,7 @@ https://<你的 worker 域名>/registerWebhook
 1. 在 `Workers & Pages → 设置 → 变量和机密` 中设置 `GROUP_ID`（论坛群组 ID，如 `-1001234567890`）。
 2. 确保机器人在该群组是管理员，让拥有“管理话题”权限，并且群组要确保群组开启了话题功能。
 3. 在 Telegram 你的刚刚创建的bot中发送 `/menu`，点击「💬 转发模式」，切换为“话题转发”。
-4. 其实第7步完成应该会弹窗
+4. 其实步骤 4 完成后应该会弹窗
 
 启用后，机器人会为每位访客自动创建话题，并把后续消息都发到对应的话题中。管理员在话题里回复即可把消息回传给访客。
 
