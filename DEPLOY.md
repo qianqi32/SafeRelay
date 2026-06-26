@@ -4,6 +4,24 @@
 
 ---
 
+## 方案 A：通过 Cloudflare Dashboard 连接 GitHub 部署（推荐）
+
+不需要在本地安装任何工具，全程在网页上完成：
+
+1. 进入 [Cloudflare Dashboard](https://dash.cloudflare.com/) → **Workers & Pages**
+2. 点击 **创建应用程序** → **Pages** → **连接到 Git**
+3. 授权 GitHub 账号，选择你的仓库 `yrlight/SafeRelay`
+4. **框架预设** 选择 **None**（保持默认）
+5. **构建命令** 留空
+6. **构建输出目录** 留空
+7. 点击 **保存并部署** — Worker 会自动创建
+
+> ⚠️ 部署后还需要设置环境变量！往下看 **设置环境变量** 章节。
+
+**优点：** 之后每次 push 到 GitHub，Cloudflare 会自动重新部署。
+
+---
+
 ## 前置准备
 
 部署前需要准备以下内容：

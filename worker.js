@@ -3550,7 +3550,13 @@ function shouldFallbackToCopy(result) {
 function isForwardedToExpectedThread(result, target) {
   if (!target?.threadId || !result?.ok) return true;
   const messages = Array.isArray(result.result) ? result.result : [result.result];
-  return messages.every(msg => msg && Number(msg.message_thread_id) === Number(target.threadId));
+  return messages.every(msg => {
+    if (!msg) return false;
+    // copyMessage/copyMessages 返回 MessageId（无 message_thread_id），无法校验线程，
+    // payload 已指定 message_thread_id，由 Telegram 保证投递到正确话题 → 视为通过
+    if (msg.message_thread_id === undefined || msg.message_thread_id === null) return true;
+    return Number(msg.message_thread_id) === Number(target.threadId);
+  });
 }
 
 async function deleteForwardedResultMessages(result, target) {
@@ -6252,11 +6258,21 @@ async function handleAdminMessage(message) {
     }
 
     if (guestChatId) {
-      const copyReq = await copyMessage({
+      // 【引用回复】查出管理员所引用的转发消息对应的用户原始消息 ID，
+      // 复制时带上 reply_parameters，让用户看到这条回复引用的是自己发的哪条消息
+      const guestOrigMsgId = await KV.get('fwd-orig-' + reply.message_id);
+      const copyPayload = {
         chat_id: guestChatId,
         from_chat_id: message.chat.id,
         message_id: message.message_id,
-      });
+      };
+      if (guestOrigMsgId) {
+        copyPayload.reply_parameters = {
+          message_id: parseInt(guestOrigMsgId, 10),
+          allow_sending_without_reply: true
+        };
+      }
+      const copyReq = await copyMessage(copyPayload);
 
       // 存储管理员回复消息与访客收到消息的映射关系
       if (copyReq.ok && copyReq.result && copyReq.result.message_id) {
@@ -6264,6 +6280,13 @@ async function handleAdminMessage(message) {
           guestChatId: guestChatId,
           guestMessageId: copyReq.result.message_id
         }), { expirationTtl: 172800 });
+        // 【引用回复-反向】记录"用户聊天里收到的这条 bot 消息 → 管理员在群里发的原消息"。
+        // 用户引用这条 bot 消息回复时，可让管理员看到引用的是自己发的哪条（仅话题模式下生效）
+        await KV.put(
+          'guest-reply-map-' + guestChatId + ':' + copyReq.result.message_id,
+          message.message_id.toString(),
+          { expirationTtl: 172800 }
+        );
       }
 
       return copyReq;
@@ -7132,6 +7155,43 @@ async function forwardMessagesToTarget(messages, userId, target) {
   }
   if (messages.length === 1) {
     const msg = messages[0];
+
+    // 【话题模式】一律用 copyMessage 复制到话题，不显示「转发自 XX」头部（靠话题名标识用户）。
+    // 若用户引用了某条 bot 消息，再带上 reply_parameters，让管理员看到被引用的原消息。
+    // （forwardMessage 不支持 reply_parameters；话题已标识用户，复制无来源歧义）
+    if (target.label === 'topic') {
+      const copyPayload = {
+        chat_id: target.chatId,
+        from_chat_id: msg.chat.id,
+        message_id: msg.message_id
+      };
+      if (target.threadId) copyPayload.message_thread_id = target.threadId;
+
+      if (msg.reply_to_message && msg.reply_to_message.message_id) {
+        const adminOrigMsgId = await KV.get('guest-reply-map-' + userId + ':' + msg.reply_to_message.message_id);
+        if (adminOrigMsgId) {
+          copyPayload.reply_parameters = {
+            message_id: parseInt(adminOrigMsgId, 10),
+            allow_sending_without_reply: true
+          };
+        }
+      }
+
+      const copyReq = await requestTelegram('copyMessage', copyPayload);
+      if (copyReq.ok && copyReq.result && copyReq.result.message_id) {
+        // 注意：copyMessage 返回的是 MessageId 对象，不含 message_thread_id，
+        // 无法做线程校验。payload 已指定 message_thread_id，Telegram 保证投递到正确话题。
+        await storeForwardMapping(copyReq.result.message_id, msg, target);
+        return { ok: true, result: copyReq.result };
+      }
+      // copyMessage 失败：交给统一错误处理（话题失效会触发重建）
+      const outcome = await handleSingleForwardResult(copyReq, msg, target, userId);
+      if (outcome.success) {
+        return { ok: true, result: copyReq.result };
+      }
+      return { ok: false, errorType: outcome.errorType, raw: copyReq };
+    }
+
     const payload = {
       chat_id: target.chatId,
       from_chat_id: msg.chat.id,
@@ -7149,6 +7209,24 @@ async function forwardMessagesToTarget(messages, userId, target) {
 
   const firstMsg = messages[0];
   const messageIds = messages.map(m => m.message_id);
+
+  // 【话题模式】批量也用 copyMessages 复制到话题，不显示「转发自 XX」头部
+  if (target.label === 'topic') {
+    const copyPayload = {
+      chat_id: target.chatId,
+      from_chat_id: firstMsg.chat.id,
+      message_ids: messageIds
+    };
+    if (target.threadId) copyPayload.message_thread_id = target.threadId;
+
+    const copyReq = await requestTelegram('copyMessages', copyPayload);
+    const outcome = await handleBatchForwardResult(copyReq, messages, target, userId, messageIds.length);
+    if (outcome.success) {
+      return { ok: true, result: copyReq.result };
+    }
+    return { ok: false, errorType: outcome.errorType, raw: copyReq };
+  }
+
   const payload = {
     chat_id: target.chatId,
     from_chat_id: firstMsg.chat.id,
@@ -7244,6 +7322,8 @@ async function storeForwardMapping(forwardedMessageId, originalMessage, target =
   try {
     await KV.put('msg-map-' + forwardedMessageId, originalMessage.chat.id.toString(), { expirationTtl: 172800 });
     await KV.put('orig-map-' + originalMessage.message_id, forwardedMessageId.toString(), { expirationTtl: 172800 });
+    // 反查映射：转发消息 ID → 用户原始消息 ID，用于管理员引用回复时让用户看到被引用的原消息
+    await KV.put('fwd-orig-' + forwardedMessageId, originalMessage.message_id.toString(), { expirationTtl: 172800 });
     if (target && target.chatId) {
       await KV.put(
         'fwd-loc-' + forwardedMessageId,
@@ -7283,11 +7363,8 @@ async function tryCopySingleMessage(msg, target) {
 
   const copyReq = await requestTelegram('copyMessage', payload);
   if (copyReq.ok && copyReq.result && copyReq.result.message_id) {
-    if (!isForwardedToExpectedThread(copyReq, target)) {
-      Logger.warn('copy_single_misdirected_thread', { expectedThreadId: target.threadId, actualThreadId: copyReq.result.message_thread_id });
-      await deleteForwardedResultMessages(copyReq, target);
-      return { success: false, rawResult: { ...copyReq, errorType: 'thread_not_found' } };
-    }
+    // 注：copyMessage 返回的是 MessageId（仅含 message_id），无 message_thread_id，
+    // 无法校验线程；payload 已带 message_thread_id，由 Telegram 保证投递到正确话题。
     await storeForwardMapping(copyReq.result.message_id, msg, target);
     return { success: true };
   }
@@ -7305,11 +7382,8 @@ async function copyMessagesIndividually(messages, target) {
 
     const copyReq = await requestTelegram('copyMessage', payload);
     if (copyReq.ok && copyReq.result && copyReq.result.message_id) {
-      if (!isForwardedToExpectedThread(copyReq, target)) {
-        Logger.warn('copy_batch_item_misdirected_thread', { expectedThreadId: target.threadId, actualThreadId: copyReq.result.message_thread_id });
-        await deleteForwardedResultMessages(copyReq, target);
-        return { success: false, rawResult: { ...copyReq, errorType: 'thread_not_found' } };
-      }
+      // copyMessage 返回 MessageId（无 message_thread_id），无法校验线程；
+      // payload 已带 message_thread_id，由 Telegram 保证投递到正确话题。
       await storeForwardMapping(copyReq.result.message_id, msg, target);
     } else {
       return { success: false, rawResult: copyReq };
