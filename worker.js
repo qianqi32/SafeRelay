@@ -6258,19 +6258,23 @@ async function handleAdminMessage(message) {
     }
 
     if (guestChatId) {
-      // 【引用回复】查出管理员所引用的转发消息对应的用户原始消息 ID，
-      // 复制时带上 reply_parameters，让用户看到这条回复引用的是自己发的哪条消息
-      const guestOrigMsgId = await KV.get('fwd-orig-' + reply.message_id);
+      // 【引用回复】仅话题模式下传播引用关系：话题模式靠话题路由，管理员引用某条消息
+      // 是真实的引用意图，复制时带上 reply_parameters 让用户看到引用的是自己哪条消息。
+      // 私聊模式下，引用回复只是识别"回复给谁"的路由手段，不应作为引用传给用户
+      // （否则用户视角下每条回复都变成引用回复）。
       const copyPayload = {
         chat_id: guestChatId,
         from_chat_id: message.chat.id,
         message_id: message.message_id,
       };
-      if (guestOrigMsgId) {
-        copyPayload.reply_parameters = {
-          message_id: parseInt(guestOrigMsgId, 10),
-          allow_sending_without_reply: true
-        };
+      if (isInTopic) {
+        const guestOrigMsgId = await KV.get('fwd-orig-' + reply.message_id);
+        if (guestOrigMsgId) {
+          copyPayload.reply_parameters = {
+            message_id: parseInt(guestOrigMsgId, 10),
+            allow_sending_without_reply: true
+          };
+        }
       }
       const copyReq = await copyMessage(copyPayload);
 
