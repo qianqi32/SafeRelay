@@ -6258,10 +6258,6 @@ async function handleAdminMessage(message) {
     }
 
     if (guestChatId) {
-      // 【引用回复】仅话题模式下传播引用关系：话题模式靠话题路由，管理员引用某条消息
-      // 是真实的引用意图，复制时带上 reply_parameters 让用户看到引用的是自己哪条消息。
-      // 私聊模式下，引用回复只是识别"回复给谁"的路由手段，不应作为引用传给用户
-      // （否则用户视角下每条回复都变成引用回复）。
       const copyPayload = {
         chat_id: guestChatId,
         from_chat_id: message.chat.id,
@@ -6278,14 +6274,11 @@ async function handleAdminMessage(message) {
       }
       const copyReq = await copyMessage(copyPayload);
 
-      // 存储管理员回复消息与访客收到消息的映射关系
       if (copyReq.ok && copyReq.result && copyReq.result.message_id) {
         await KV.put('admin-reply-map-' + message.message_id, JSON.stringify({
           guestChatId: guestChatId,
           guestMessageId: copyReq.result.message_id
         }), { expirationTtl: 172800 });
-        // 【引用回复-反向】记录"用户聊天里收到的这条 bot 消息 → 管理员在群里发的原消息"。
-        // 用户引用这条 bot 消息回复时，可让管理员看到引用的是自己发的哪条（仅话题模式下生效）
         await KV.put(
           'guest-reply-map-' + guestChatId + ':' + copyReq.result.message_id,
           message.message_id.toString(),
@@ -7497,16 +7490,38 @@ async function handleAdminEditedMessage(message) {
     try {
       const { guestChatId, guestMessageId } = JSON.parse(replyMapData);
 
-      // 尝试编辑发送给访客的消息
-      const editReq = await requestTelegram('editMessageText', {
-        chat_id: guestChatId,
-        message_id: guestMessageId,
-        text: message.text || ''
-      });
+      // 【修复】编辑同步时携带格式信息（entities）。加粗/斜体/引用等格式都在
+      // message.entities / caption_entities 里，只传纯文本会丢失格式，且当仅改格式、
+      // 可见文本未变时 Telegram 会返回 400 "message is not modified"。
+      let editReq;
+      if (typeof message.text === 'string') {
+        editReq = await requestTelegram('editMessageText', {
+          chat_id: guestChatId,
+          message_id: guestMessageId,
+          text: message.text,
+          entities: message.entities || undefined
+        });
+      } else if (typeof message.caption === 'string') {
+        // 图片/文件等带文字说明的消息
+        editReq = await requestTelegram('editMessageCaption', {
+          chat_id: guestChatId,
+          message_id: guestMessageId,
+          caption: message.caption,
+          caption_entities: message.caption_entities || undefined
+        });
+      } else {
+        // 无文本内容（例如仅替换媒体），无法同步编辑
+        return;
+      }
 
       if (!editReq.ok) {
-        // 编辑失败，只通知管理员
         const errorCode = editReq.error_code;
+        const desc = (editReq.description || '').toLowerCase();
+
+        // 内容未变化：视为成功，不打扰管理员（常见于仅调整了不可见字符或重复编辑）
+        if (desc.includes('message is not modified')) {
+          return;
+        }
 
         // 消息已过期或被删除 (错误码 400)
         if (errorCode === 400) {
