@@ -6303,11 +6303,14 @@ async function handleAdminMessage(message) {
           message.message_id.toString(),
           { expirationTtl: 172800 }
         );
-        // 【表情回应】管理员原消息 ↔ 用户收到的副本，互记对等坐标，供表情镜像
-        await storeReactionPeers(
-          { chat_id: String(message.chat.id), message_id: message.message_id },
-          { chat_id: String(guestChatId), message_id: copyReq.result.message_id }
-        );
+        // 【表情回应】仅话题模式记录对等坐标（私聊模式不需要 react）。
+        // 管理员原消息 ↔ 用户收到的副本，供表情镜像。
+        if (isInTopic) {
+          await storeReactionPeers(
+            { chat_id: String(message.chat.id), message_id: message.message_id },
+            { chat_id: String(guestChatId), message_id: copyReq.result.message_id }
+          );
+        }
       }
 
       return copyReq;
@@ -7352,11 +7355,14 @@ async function storeForwardMapping(forwardedMessageId, originalMessage, target =
         JSON.stringify({ chat_id: target.chatId, thread_id: target.threadId || null }),
         { expirationTtl: 172800 }
       );
-      // 【表情回应】记录用户原消息 ↔ 群/管理员副本的对等坐标，供 react 镜像互查
-      await storeReactionPeers(
-        { chat_id: originalMessage.chat.id, message_id: originalMessage.message_id },
-        { chat_id: target.chatId, message_id: forwardedMessageId }
-      );
+      // 【表情回应】仅话题模式记录对等坐标（私聊模式不需要 react）。
+      // 用户原消息 ↔ 群副本，供 react 镜像互查。
+      if (target.label === 'topic') {
+        await storeReactionPeers(
+          { chat_id: originalMessage.chat.id, message_id: originalMessage.message_id },
+          { chat_id: target.chatId, message_id: forwardedMessageId }
+        );
+      }
     }
   } catch (e) {
     Logger.warn('store_forward_mapping_failed', e, {
