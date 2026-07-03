@@ -3723,6 +3723,22 @@ async function handleWebhook(event, url) {
   return new Response('Ok');
 }
 
+// 【引用片段】当回复者选中部分文字引用时，Telegram 在 message.quote 中带上
+// { text, entities, position }。将其透传到 reply_parameters，让对方也只看到被引用的片段，
+// 而非整条消息。未选中片段时 message.quote 不存在，返回空对象即可。
+function buildReplyQuoteParams(message) {
+  const quote = message && message.quote;
+  if (!quote || typeof quote.text !== 'string') return {};
+  const params = { quote: quote.text };
+  if (Array.isArray(quote.entities) && quote.entities.length) {
+    params.quote_entities = quote.entities;
+  }
+  if (typeof quote.position === 'number') {
+    params.quote_position = quote.position;
+  }
+  return params;
+}
+
 async function onUpdate(update, origin) {
   if ('callback_query' in update) {
     const callbackQuery = update.callback_query;
@@ -3742,6 +3758,8 @@ async function onUpdate(update, origin) {
     if (isAdmin(userId)) {
       return handleAdminCallback(callbackQuery);
     }
+  } else if ('message_reaction' in update) {
+    await handleMessageReaction(update.message_reaction);
   } else if ('message' in update) {
     await onMessage(update.message, origin);
   } else if ('edited_message' in update) {
@@ -6268,7 +6286,8 @@ async function handleAdminMessage(message) {
         if (guestOrigMsgId) {
           copyPayload.reply_parameters = {
             message_id: parseInt(guestOrigMsgId, 10),
-            allow_sending_without_reply: true
+            allow_sending_without_reply: true,
+            ...buildReplyQuoteParams(message)
           };
         }
       }
@@ -6284,6 +6303,14 @@ async function handleAdminMessage(message) {
           message.message_id.toString(),
           { expirationTtl: 172800 }
         );
+        // 【表情回应】仅话题模式记录对等坐标（私聊模式不需要 react）。
+        // 管理员原消息 ↔ 用户收到的副本，供表情镜像。
+        if (isInTopic) {
+          await storeReactionPeers(
+            { chat_id: String(message.chat.id), message_id: message.message_id },
+            { chat_id: String(guestChatId), message_id: copyReq.result.message_id }
+          );
+        }
       }
 
       return copyReq;
@@ -7169,7 +7196,8 @@ async function forwardMessagesToTarget(messages, userId, target) {
         if (adminOrigMsgId) {
           copyPayload.reply_parameters = {
             message_id: parseInt(adminOrigMsgId, 10),
-            allow_sending_without_reply: true
+            allow_sending_without_reply: true,
+            ...buildReplyQuoteParams(msg)
           };
         }
       }
@@ -7327,12 +7355,79 @@ async function storeForwardMapping(forwardedMessageId, originalMessage, target =
         JSON.stringify({ chat_id: target.chatId, thread_id: target.threadId || null }),
         { expirationTtl: 172800 }
       );
+      // 【表情回应】仅话题模式记录对等坐标（私聊模式不需要 react）。
+      // 用户原消息 ↔ 群副本，供 react 镜像互查。
+      if (target.label === 'topic') {
+        await storeReactionPeers(
+          { chat_id: originalMessage.chat.id, message_id: originalMessage.message_id },
+          { chat_id: target.chatId, message_id: forwardedMessageId }
+        );
+      }
     }
   } catch (e) {
     Logger.warn('store_forward_mapping_failed', e, {
       forwardedMessageId,
       originalMessageId: originalMessage.message_id
     });
+  }
+}
+
+// 【表情回应】记录一对镜像消息的对等坐标（双向），供 message_reaction 镜像时互查。
+// a、b 均为 { chat_id, message_id }。任一侧被点表情，都能定位到另一侧的镜像消息。
+async function storeReactionPeers(a, b) {
+  if (!a || !b || !a.chat_id || !a.message_id || !b.chat_id || !b.message_id) return;
+  try {
+    await Promise.all([
+      KV.put(`react-peer-${a.chat_id}-${a.message_id}`, JSON.stringify(b), { expirationTtl: 172800 }),
+      KV.put(`react-peer-${b.chat_id}-${b.message_id}`, JSON.stringify(a), { expirationTtl: 172800 }),
+    ]);
+  } catch (e) {
+    Logger.warn('store_reaction_peers_failed', e, { a, b });
+  }
+}
+
+async function getReactionPeer(chatId, messageId) {
+  return await safeGetJSON(`react-peer-${chatId}-${messageId}`, null);
+}
+
+// 【表情回应】处理 message_reaction 更新，将表情镜像到对等消息。
+// 方向：
+//   - 用户私聊里对 bot 消息点表情 → 镜像到管理员/群里的副本
+//   - 群里话题内点表情 → 仅当点表情者是管理员时，镜像给用户（避免群成员表情泄露给用户）
+// Telegram 不推送 bot 自己设置的 react，因此不会形成循环。
+async function handleMessageReaction(reaction) {
+  try {
+    const chatId = reaction.chat?.id ? String(reaction.chat.id) : null;
+    const messageId = reaction.message_id;
+    if (!chatId || !messageId) return;
+
+    // 群组侧：只镜像管理员的表情，忽略其他群成员
+    if (GROUP_ID && chatId === GROUP_ID) {
+      const reactorId = reaction.user?.id ? String(reaction.user.id) : null;
+      if (!reactorId || !isAdmin(reactorId)) {
+        Logger.debug('reaction_ignored_non_admin', { chatId, reactorId });
+        return;
+      }
+    }
+
+    const peer = await getReactionPeer(chatId, messageId);
+    if (!peer || !peer.chat_id || !peer.message_id) {
+      Logger.debug('reaction_peer_not_found', { chatId, messageId });
+      return;
+    }
+
+    const newReaction = Array.isArray(reaction.new_reaction) ? reaction.new_reaction : [];
+    const result = await requestTelegram('setMessageReaction', {
+      chat_id: peer.chat_id,
+      message_id: peer.message_id,
+      reaction: newReaction
+    });
+
+    if (!result.ok) {
+      Logger.warn('mirror_reaction_failed', { chatId, messageId, peer, description: result.description });
+    }
+  } catch (e) {
+    Logger.error('handle_message_reaction_failed', e);
   }
 }
 
@@ -7559,7 +7654,15 @@ async function handleAdminEditedMessage(message) {
 
 async function registerWebhook(event, requestUrl, suffix, secret) {
   const webhookUrl = `${requestUrl.protocol}//${requestUrl.hostname}${suffix}`;
-  const r = await (await fetch(apiUrl('setWebhook', { url: webhookUrl, secret_token: secret }))).json();
+  // 【表情回应】默认的 allowed_updates 不含 message_reaction，必须显式声明才能收到表情事件。
+  // 一旦指定 allowed_updates 即为完整替换，因此需列全所有用到的更新类型。
+  const allowedUpdates = JSON.stringify([
+    'message',
+    'edited_message',
+    'callback_query',
+    'message_reaction'
+  ]);
+  const r = await (await fetch(apiUrl('setWebhook', { url: webhookUrl, secret_token: secret, allowed_updates: allowedUpdates }))).json();
 
   // 注册 Webhook 成功后设置命令列表
   if ('ok' in r && r.ok) {

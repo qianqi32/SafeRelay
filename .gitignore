@@ -1,0 +1,16 @@
+# IDE / 编辑器
+*.code-workspace
+.vscode/
+.idea/
+
+# 依赖与构建产物
+node_modules/
+dist/
+
+# 本地环境变量与密钥
+.env
+.dev.vars
+
+# 系统文件
+.DS_Store
+Thumbs.db
