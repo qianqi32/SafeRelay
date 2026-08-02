@@ -14,6 +14,7 @@ const getEnv = (key) => {
 
 const TOKEN = getEnv('ENV_BOT_TOKEN');
 const WEBHOOK = '/endpoint';
+const MANAGEMENT_HEADER = 'X-SafeRelay-Admin-Secret';
 const SECRET = getEnv('ENV_BOT_SECRET');
 const RAW_ADMIN_UID = getEnv('ENV_ADMIN_UID');
 const ADMIN_IDS_ENV = getEnv('ADMIN_IDS');
@@ -83,10 +84,10 @@ function parseAdminIdList(primaryId, allowlistEnv) {
     }
   };
 
-  if (allowlistEnv) {
-    allowlistEnv.split(/[,;\s]+/).forEach(pushId);
-  }
   pushId(primaryId);
+  if (allowlistEnv) {
+    String(allowlistEnv).split(/[,;\s]+/).forEach(pushId);
+  }
   return ids;
 }
 
@@ -2331,9 +2332,9 @@ async function processPendingMessagesAfterVerification(userId) {
     topicContext = await ensureUserTopic(userId, await getUserProfile(userId));
   }
 
-  const targetForPending = topicContext && topicContext.threadId
-    ? { chatId: GROUP_ID, threadId: topicContext.threadId, label: 'topic' }
-    : { chatId: ADMIN_UID, label: 'admin_dm' };
+  const targetsForPending = topicContext && topicContext.threadId
+    ? [{ chatId: GROUP_ID, threadId: topicContext.threadId, label: 'topic' }]
+    : ADMIN_ID_LIST.map(adminId => ({ chatId: adminId, label: 'admin_dm' }));
 
   // 【优化】批量处理，添加小延迟避免触发限制
   for (let i = 0; i < sortedIds.length; i++) {
@@ -2349,46 +2350,20 @@ async function processPendingMessagesAfterVerification(userId) {
         }
       }
 
-      // 尝试转发消息（通过复制方式）
-      const payload = {
-        chat_id: targetForPending.chatId,
-        from_chat_id: userId,
-        message_id: msgId
-      };
-      if (targetForPending.threadId) {
-        payload.message_thread_id = targetForPending.threadId;
-      }
+      const pendingMessageRef = { chat: { id: userId }, message_id: msgId };
+      const results = await Promise.all(targetsForPending.map(target =>
+        forwardMessagesToTarget([pendingMessageRef], userId, target)
+      ));
 
-      const result = await forwardMessage(payload);
-
-      if (result.ok && result.result && result.result.message_id) {
-        if (!isForwardedToExpectedThread(result, targetForPending)) {
-          Logger.warn('pending_forward_misdirected_thread', { userId, messageId: msgId, expectedThreadId: targetForPending.threadId, actualThreadId: result.result.message_thread_id });
-          await deleteForwardedResultMessages(result, targetForPending);
-          failed++;
-          failedMessages.push(msgId);
-        } else {
-          forwarded++;
-          await storeForwardMapping(
-            result.result.message_id,
-            { chat: { id: userId }, message_id: msgId },
-            targetForPending
-          );
-          await deletePendingMessageSnapshot(userId, msgId);
-        }
-      } else if (result.ok) {
+      if (results.some(result => result?.ok)) {
         forwarded++;
         await deletePendingMessageSnapshot(userId, msgId);
+      } else if (results.some(result => result?.errorType === 'message_not_found')) {
+        Logger.warn('pending_message_not_found', { userId, messageId: msgId });
+        await deletePendingMessageSnapshot(userId, msgId);
       } else {
-        // 【优化】区分错误类型：消息不存在 vs 其他错误
-        if (result.description && result.description.includes('message to forward not found')) {
-          Logger.warn('pending_message_not_found', { userId, messageId: msgId });
-          await deletePendingMessageSnapshot(userId, msgId);
-          // 消息不存在，视为成功（不需要重试）
-        } else {
-          failed++;
-          failedMessages.push(msgId);
-        }
+        failed++;
+        failedMessages.push(msgId);
       }
     } catch (e) {
       Logger.error('forward_pending_message_failed', e, { userId, messageId: msgId });
@@ -2810,49 +2785,31 @@ async function checkRateLimitKV(userId, type = 'verify') {
   return { allowed: true, remaining: config.maxRequests - timestamps.length };
 }
 
-// 已验证用户列表管理（新版：同时保存用户ID和昵称）
+// 已验证用户列表管理。每个用户独立存储，避免并发验证覆盖共享列表。
+const VERIFIED_USER_PREFIX = 'verified-user:';
+const LEGACY_VERIFIED_USERS_KEY = 'verified_users_list_v2';
+
 async function addVerifiedUser(userId, userInfo = null) {
-  const key = 'verified_users_list_v2';
   try {
-    // 确保用户ID是字符串
     const userIdStr = String(userId);
-
-    const users = await KV.get(key);
-    const userMap = users ? new Map(JSON.parse(users)) : new Map();
-
-    // 获取用户昵称
-    let userName = userInfo;
-    if (!userName) {
-      // 尝试从已有数据获取
-      const existing = userMap.get(userIdStr);
-      if (existing) userName = existing;
-    }
-    if (!userName) userName = 'Unknown';
-
-    // 只有新用户或昵称变化才更新
-    const existing = userMap.get(userIdStr);
-    if (!existing || existing !== userName) {
-      userMap.set(userIdStr, userName);
-      await KV.put(key, JSON.stringify([...userMap]));
-    }
+    const userName = userInfo || await getUserDisplayName(userIdStr) || 'Unknown';
+    await KV.put(`${VERIFIED_USER_PREFIX}${userIdStr}`, userName);
   } catch (e) {
     Logger.error('add_verified_user_failed', e, { userId });
   }
 }
 
 async function removeVerifiedUser(userId) {
-  const key = 'verified_users_list_v2';
   try {
-    // 确保用户ID是字符串
     const userIdStr = String(userId);
+    await KV.delete(`${VERIFIED_USER_PREFIX}${userIdStr}`);
 
-    const users = await KV.get(key);
-    if (!users) return;
-
-    const userMap = new Map(JSON.parse(users));
-    if (userMap.has(userIdStr)) {
-      userMap.delete(userIdStr);
-      await KV.put(key, JSON.stringify([...userMap]));
+    const users = await KV.get(LEGACY_VERIFIED_USERS_KEY);
+    if (users) {
+      const userMap = new Map(JSON.parse(users));
+      if (userMap.delete(userIdStr)) {
+        await KV.put(LEGACY_VERIFIED_USERS_KEY, JSON.stringify([...userMap]));
+      }
     }
   } catch (e) {
     Logger.error('remove_verified_user_failed', e, { userId });
@@ -2860,18 +2817,29 @@ async function removeVerifiedUser(userId) {
 }
 
 async function getAllVerifiedUsers() {
-  const key = 'verified_users_list_v2';
   try {
-    const users = await KV.get(key);
-    if (!users) {
-      return [];
-    }
-    // 确保所有key都是字符串
-    const parsed = JSON.parse(users);
     const normalizedMap = new Map();
-    for (const [k, v] of parsed) {
-      normalizedMap.set(String(k), v);
+    const legacyUsers = await KV.get(LEGACY_VERIFIED_USERS_KEY);
+    if (legacyUsers) {
+      for (const [userId, userName] of JSON.parse(legacyUsers)) {
+        const userIdStr = String(userId);
+        if (await KV.get(`verified-${userIdStr}`) === 'true') {
+          normalizedMap.set(userIdStr, userName);
+        }
+      }
     }
+
+    let cursor;
+    do {
+      const result = await KV.list({ prefix: VERIFIED_USER_PREFIX, cursor, limit: 1000 });
+      for (const key of result.keys) {
+        const userId = key.name.slice(VERIFIED_USER_PREFIX.length);
+        const userName = await KV.get(key.name);
+        if (userName !== null) normalizedMap.set(userId, userName);
+      }
+      cursor = result.list_complete ? null : result.cursor;
+    } while (cursor);
+
     return [...normalizedMap];
   } catch (e) {
     Logger.error('get_verified_users_failed', e);
@@ -3076,11 +3044,12 @@ async function sendBroadcastBatch(broadcastMsg, offset, batchSize) {
   const blockedSet = await loadBlockedUsersSet();
 
   let sent = 0, failed = 0, skipped = 0;
+  let processed = offset;
   const startTime = Date.now();
   const maxDuration = 25000; // 25秒超时
   let timedOut = false;
 
-  for (const entry of batch) {
+  for (const [index, entry] of batch.entries()) {
     // 兼容旧/新两种数据结构：[userId, name] 或 userId 字符串
     const userId = Array.isArray(entry) ? String(entry[0]) : String(entry);
 
@@ -3089,6 +3058,7 @@ async function sendBroadcastBatch(broadcastMsg, offset, batchSize) {
       timedOut = true;
       break;
     }
+    processed = offset + index + 1;
 
     // 【优化】内存集合 O(1) 查找，无需 KV 调用
     if (blockedSet.has(userId)) {
@@ -3114,8 +3084,7 @@ async function sendBroadcastBatch(broadcastMsg, offset, batchSize) {
     }
   }
 
-  const processed = offset + sent + skipped;
-  const hasMore = processed < total && !timedOut;
+  const hasMore = processed < total;
 
   return {
     sent: offset + sent,
@@ -3150,55 +3119,23 @@ async function loadBlockedUsersSet() {
 }
 
 // 统计功能
-// 【优化】内存累加 + 延迟刷写，避免每条消息触发 2 次 KV.get + 2 次 KV.put
-const FLUSH_INTERVAL_MS = 30 * 1000;
-const _statsBuffer = { daily: 0, total: 0, today: '', dirty: false, flushing: false };
+async function incrementMessageCount() {
+  const today = new Date().toISOString().split('T')[0];
+  const dailyKey = `stats:messages:${today}`;
+  const totalKey = 'stats:messages:total';
 
-async function _flushStatsBuffer() {
-  if (_statsBuffer.flushing || !_statsBuffer.dirty) return;
-  _statsBuffer.flushing = true;
-  _statsBuffer.dirty = false;
   try {
-    const dailyKey = `stats:messages:${_statsBuffer.today}`;
-    const totalKey = 'stats:messages:total';
     const [dailyCount, totalCount] = await Promise.all([
       KV.get(dailyKey),
       KV.get(totalKey),
     ]);
-    const newDaily = parseInt(dailyCount || '0') + _statsBuffer.daily;
-    const newTotal = parseInt(totalCount || '0') + _statsBuffer.total;
     await Promise.all([
-      KV.put(dailyKey, String(newDaily), { expirationTtl: 86400 * 30 }),
-      KV.put(totalKey, String(newTotal)),
+      KV.put(dailyKey, String(parseInt(dailyCount || '0') + 1), { expirationTtl: 86400 * 30 }),
+      KV.put(totalKey, String(parseInt(totalCount || '0') + 1)),
     ]);
-    _statsBuffer.daily = 0;
-    _statsBuffer.total = 0;
   } catch (e) {
-    Logger.error('flush_stats_buffer_failed', e);
-    _statsBuffer.dirty = true;
-  } finally {
-    _statsBuffer.flushing = false;
+    Logger.error('increment_message_count_failed', e);
   }
-}
-
-function _scheduleStatsFlush() {
-  setTimeout(_flushStatsBuffer, FLUSH_INTERVAL_MS);
-}
-
-async function incrementMessageCount() {
-  const today = new Date().toISOString().split('T')[0];
-  if (_statsBuffer.today !== today) {
-    if (_statsBuffer.dirty) {
-      await _flushStatsBuffer();
-    }
-    _statsBuffer.today = today;
-    _statsBuffer.daily = 0;
-    _statsBuffer.total = 0;
-  }
-  _statsBuffer.daily++;
-  _statsBuffer.total++;
-  _statsBuffer.dirty = true;
-  _scheduleStatsFlush();
 }
 
 async function recordActiveUser(userId) {
@@ -3694,9 +3631,9 @@ addEventListener('fetch', event => {
   if (url.pathname === WEBHOOK) {
     event.respondWith(handleWebhook(event, url));
   } else if (url.pathname === '/registerWebhook') {
-    event.respondWith(registerWebhook(event, url, WEBHOOK, SECRET));
+    event.respondWith(handleWebhookManagement(event.request, () => registerWebhook(event, url, WEBHOOK, SECRET)));
   } else if (url.pathname === '/unRegisterWebhook') {
-    event.respondWith(unRegisterWebhook(event));
+    event.respondWith(handleWebhookManagement(event.request, () => unRegisterWebhook(event)));
   } else if (url.pathname === '/verify') {
     event.respondWith(handleVerifyPage(event.request));
   } else if (url.pathname === '/verify-callback') {
@@ -3705,6 +3642,14 @@ addEventListener('fetch', event => {
     event.respondWith(new Response('No handler for this request'));
   }
 });
+
+async function handleWebhookManagement(request, action) {
+  const managementSecret = request.headers.get(MANAGEMENT_HEADER) || '';
+  if (request.method !== 'POST' || !constantTimeCompare(managementSecret, SECRET)) {
+    return new Response('Forbidden', { status: 403 });
+  }
+  return action();
+}
 
 async function handleWebhook(event, url) {
   // 【安全加固】校验 Telegram Webhook secret_token 头部，防止伪造请求
@@ -4033,7 +3978,8 @@ async function getTargetId(message, commandName) {
 
   // 优先 1：从回复的消息中提取
   if (reply && (reply.forward_from || reply.forward_sender_name)) {
-    const guestChatId = await KV.get('msg-map-' + reply.message_id);
+    const guestChatId = await KV.get(`msg-map-${contextChatId}:${reply.message_id}`)
+      || await KV.get('msg-map-' + reply.message_id);
     if (guestChatId) return guestChatId;
   }
 
@@ -6232,13 +6178,14 @@ async function handleAdminMessage(message) {
       Logger.info('admin_reply_in_topic_mode', { adminChatId, threadId, guestChatId });
     }
 
+    const scopedMessageMapKey = `msg-map-${contextChatId}:${reply.message_id}`;
     // 情况 1：回复转发消息
     if (!guestChatId && (reply.forward_from || reply.forward_sender_name)) {
-      guestChatId = await KV.get('msg-map-' + reply.message_id);
+      guestChatId = await KV.get(scopedMessageMapKey) || await KV.get('msg-map-' + reply.message_id);
     }
     // 情况 2：回复编辑提示消息（以 ✏️ 开头）
     if (!guestChatId && reply.text && reply.text.startsWith('✏️')) {
-      guestChatId = await KV.get('msg-map-' + reply.message_id);
+      guestChatId = await KV.get(scopedMessageMapKey) || await KV.get('msg-map-' + reply.message_id);
     }
     // 情况 3：回复垃圾过滤菜单消息
     if (!guestChatId && reply.text && reply.text.includes('🗑 <b>垃圾消息过滤设置</b>')) {
@@ -6263,7 +6210,7 @@ async function handleAdminMessage(message) {
     }
 
     if (!guestChatId) {
-      guestChatId = await KV.get('msg-map-' + reply.message_id);
+      guestChatId = await KV.get(scopedMessageMapKey) || await KV.get('msg-map-' + reply.message_id);
     }
 
     // 【修复】检查是否是回复消息但发送了无效命令
@@ -6294,10 +6241,12 @@ async function handleAdminMessage(message) {
       const copyReq = await copyMessage(copyPayload);
 
       if (copyReq.ok && copyReq.result && copyReq.result.message_id) {
-        await KV.put('admin-reply-map-' + message.message_id, JSON.stringify({
+        const replyMapValue = JSON.stringify({
           guestChatId: guestChatId,
           guestMessageId: copyReq.result.message_id
-        }), { expirationTtl: 172800 });
+        });
+        await KV.put(`admin-reply-map-${message.chat.id}:${message.message_id}`, replyMapValue, { expirationTtl: 172800 });
+        await KV.put('admin-reply-map-' + message.message_id, replyMapValue, { expirationTtl: 172800 });
         await KV.put(
           'guest-reply-map-' + guestChatId + ':' + copyReq.result.message_id,
           message.message_id.toString(),
@@ -7072,8 +7021,8 @@ async function handleVerifyCallback(request) {
         usernameLine = `
 📎 @${escapeHtml(userInfo.username)}`;
       }
-      await requestTelegram('sendMessage', {
-        chat_id: ADMIN_UID,
+      await Promise.all(ADMIN_ID_LIST.map(adminId => requestTelegram('sendMessage', {
+        chat_id: adminId,
         text: `✅ <b>新用户验证通过</b>
 
 🆔 <code>${uid}</code> (${escapeHtml(displayName)})${usernameLine}`,
@@ -7084,7 +7033,7 @@ async function handleVerifyCallback(request) {
             { text: '👤 打开用户资料', url: `tg://user?id=${uid}` }
           ]]
         }
-      });
+      })));
     }
 
     return new Response(JSON.stringify({ success: true }), {
@@ -7146,11 +7095,25 @@ async function handleGuestMessage(message) {
 }
 
 async function forwardMessagesToAdmin(messages, userId) {
-  if (!ADMIN_UID) {
+  if (!ADMIN_ID_LIST.length) {
     Logger.error('admin_uid_missing_forward', { userId });
     return { ok: false, errorType: 'admin_missing' };
   }
-  return forwardMessagesToTarget(messages, userId, { chatId: ADMIN_UID, label: 'admin_dm' });
+
+  const results = await Promise.all(ADMIN_ID_LIST.map(adminId =>
+    forwardMessagesToTarget(messages, userId, { chatId: adminId, label: 'admin_dm' })
+  ));
+  const successful = results.filter(result => result?.ok);
+  if (successful.length > 0) {
+    return { ok: true, result: successful[0].result };
+  }
+  if (results.length && results.every(result => result?.errorType === 'bot_blocked')) {
+    await sendMessage({
+      chat_id: userId,
+      text: '⚠️ 消息发送失败：所有管理员均已屏蔽机器人，无法接收消息。'
+    });
+  }
+  return results[0] || { ok: false, errorType: 'forward_failed' };
 }
 
 async function forwardMessagesToTopic(messages, userId, threadId, attempt = 1) {
@@ -7296,11 +7259,7 @@ async function handleSingleForwardResult(result, msg, target, userId) {
     return { success: false, errorType };
   }
   if (errorType === 'bot_blocked' && target.label === 'admin_dm') {
-    Logger.warn('bot_blocked_by_admin', { userId, adminId: ADMIN_UID });
-    await sendMessage({
-      chat_id: userId,
-      text: '⚠️ 消息发送失败：管理员已屏蔽机器人，无法接收消息。'
-    });
+    Logger.warn('bot_blocked_by_admin', { userId, adminId: target.chatId });
     return { success: false, errorType };
   }
 
@@ -7345,16 +7304,21 @@ async function handleBatchForwardResult(result, messages, target, userId, count)
 async function storeForwardMapping(forwardedMessageId, originalMessage, target = null) {
   if (!forwardedMessageId || !originalMessage) return;
   try {
+    const targetChatId = target?.chatId ? String(target.chatId) : null;
     await KV.put('msg-map-' + forwardedMessageId, originalMessage.chat.id.toString(), { expirationTtl: 172800 });
+    if (targetChatId) {
+      await KV.put(`msg-map-${targetChatId}:${forwardedMessageId}`, originalMessage.chat.id.toString(), { expirationTtl: 172800 });
+    }
     await KV.put('orig-map-' + originalMessage.message_id, forwardedMessageId.toString(), { expirationTtl: 172800 });
+    if (targetChatId) {
+      await KV.put(`orig-map-${originalMessage.message_id}:${targetChatId}`, forwardedMessageId.toString(), { expirationTtl: 172800 });
+    }
     // 反查映射：转发消息 ID → 用户原始消息 ID，用于管理员引用回复时让用户看到被引用的原消息
     await KV.put('fwd-orig-' + forwardedMessageId, originalMessage.message_id.toString(), { expirationTtl: 172800 });
     if (target && target.chatId) {
-      await KV.put(
-        'fwd-loc-' + forwardedMessageId,
-        JSON.stringify({ chat_id: target.chatId, thread_id: target.threadId || null }),
-        { expirationTtl: 172800 }
-      );
+      const locationValue = JSON.stringify({ chat_id: target.chatId, thread_id: target.threadId || null });
+      await KV.put('fwd-loc-' + forwardedMessageId, locationValue, { expirationTtl: 172800 });
+      await KV.put(`fwd-loc-${targetChatId}:${forwardedMessageId}`, locationValue, { expirationTtl: 172800 });
       // 【表情回应】仅话题模式记录对等坐标（私聊模式不需要 react）。
       // 用户原消息 ↔ 群副本，供 react 镜像互查。
       if (target.label === 'topic') {
@@ -7487,15 +7451,25 @@ async function copyMessagesIndividually(messages, target) {
 async function handleGuestEditedMessage(message) {
   const origMessageId = message.message_id.toString();
   const chatId = message.chat.id.toString();
+  const topicModeEnabled = await isTopicForwardingEnabled();
+  const targetChatIds = topicModeEnabled && GROUP_ID ? [GROUP_ID] : ADMIN_ID_LIST;
 
+  for (const targetChatId of targetChatIds) {
+    await sendGuestEditNotice(message, chatId, origMessageId, String(targetChatId));
+  }
+}
+
+async function sendGuestEditNotice(message, chatId, origMessageId, targetChatId) {
   // 查找原始消息转发后的 ID（用于回复引用）
-  const forwardedMessageIdRaw = await KV.get('orig-map-' + origMessageId);
+  const forwardedMessageIdRaw = await KV.get(`orig-map-${origMessageId}:${targetChatId}`)
+    || await KV.get('orig-map-' + origMessageId);
   let forwardedMessageId = null;
   let forwardLocation = null;
   if (forwardedMessageIdRaw) {
     const numericId = parseInt(forwardedMessageIdRaw, 10);
     forwardedMessageId = Number.isNaN(numericId) ? forwardedMessageIdRaw : numericId;
-    const locRaw = await KV.get('fwd-loc-' + forwardedMessageIdRaw);
+    const locRaw = await KV.get(`fwd-loc-${targetChatId}:${forwardedMessageIdRaw}`)
+      || await KV.get('fwd-loc-' + forwardedMessageIdRaw);
     if (locRaw) {
       try {
         forwardLocation = JSON.parse(locRaw);
@@ -7506,14 +7480,14 @@ async function handleGuestEditedMessage(message) {
   }
 
   // 查找是否已有编辑提示消息
-  const editNoticeKey = `edit-notice:${chatId}:${origMessageId}`;
+  const editNoticeKey = `edit-notice:${chatId}:${origMessageId}:${targetChatId}`;
   let existingNotice = null;
   const existingNoticeRaw = await KV.get(editNoticeKey);
   if (existingNoticeRaw) {
     try {
       existingNotice = JSON.parse(existingNoticeRaw);
     } catch (e) {
-      existingNotice = { chat_id: ADMIN_UID, message_id: parseInt(existingNoticeRaw, 10) || existingNoticeRaw };
+      existingNotice = { chat_id: targetChatId, message_id: parseInt(existingNoticeRaw, 10) || existingNoticeRaw };
       Logger.warn('parse_edit_notice_failed', e, { editNoticeKey });
     }
   }
@@ -7524,7 +7498,7 @@ async function handleGuestEditedMessage(message) {
     // 已有编辑提示，尝试更新
     try {
       const editReq = await requestTelegram('editMessageText', {
-        chat_id: existingNotice.chat_id || ADMIN_UID,
+        chat_id: existingNotice.chat_id || targetChatId,
         message_id: parseInt(existingNotice.message_id),
         text: editNotice,
         parse_mode: 'HTML'
@@ -7542,10 +7516,10 @@ async function handleGuestEditedMessage(message) {
   }
 
   // 发送新的编辑提示
-  const targetChatId = forwardLocation?.chat_id || ADMIN_UID;
+  const noticeChatId = forwardLocation?.chat_id || targetChatId;
   const targetThreadId = forwardLocation?.thread_id || null;
   const sendPayload = {
-    chat_id: targetChatId,
+    chat_id: noticeChatId,
     text: editNotice,
     parse_mode: 'HTML'
   };
@@ -7560,12 +7534,13 @@ async function handleGuestEditedMessage(message) {
 
   // 存储映射关系
   if (result.ok && result.result && result.result.message_id) {
+    await KV.put(`msg-map-${noticeChatId}:${result.result.message_id}`, chatId, { expirationTtl: 172800 });
     await KV.put('msg-map-' + result.result.message_id, chatId, { expirationTtl: 172800 });
     // 存储编辑提示消息ID、位置，用于后续更新
     await KV.put(
       editNoticeKey,
       JSON.stringify({
-        chat_id: targetChatId,
+        chat_id: noticeChatId,
         message_id: result.result.message_id,
         thread_id: targetThreadId
       }),
@@ -7577,9 +7552,11 @@ async function handleGuestEditedMessage(message) {
 // 处理管理员编辑后的消息
 async function handleAdminEditedMessage(message) {
   const adminMessageId = message.message_id.toString();
+  const adminChatId = message.chat?.id ? String(message.chat.id) : ADMIN_UID;
 
   // 查找管理员回复消息的映射关系
-  const replyMapData = await KV.get('admin-reply-map-' + adminMessageId);
+  const replyMapData = await KV.get(`admin-reply-map-${adminChatId}:${adminMessageId}`)
+    || await KV.get('admin-reply-map-' + adminMessageId);
 
   if (replyMapData) {
     try {
@@ -7621,13 +7598,13 @@ async function handleAdminEditedMessage(message) {
         // 消息已过期或被删除 (错误码 400)
         if (errorCode === 400) {
           await sendMessage({
-            chat_id: ADMIN_UID,
+            chat_id: adminChatId,
             text: `⚠️ 无法编辑消息：消息已过期或被删除（超过48小时）。\n\n如需修改，请直接发送新消息。`
           });
         } else {
           // 其他错误，只通知管理员编辑失败
           await sendMessage({
-            chat_id: ADMIN_UID,
+            chat_id: adminChatId,
             text: `⚠️ 编辑消息失败：${editReq.description || '未知错误'}\n\n如需修改，请直接发送新消息。`
           });
         }
@@ -7635,14 +7612,14 @@ async function handleAdminEditedMessage(message) {
     } catch (e) {
       // 解析映射数据失败
       await sendMessage({
-        chat_id: ADMIN_UID,
+        chat_id: adminChatId,
         text: `❌ 处理编辑消息失败：${e.message}`
       });
     }
   } else {
     // 未找到映射关系，可能是旧消息或映射已过期
     await sendMessage({
-      chat_id: ADMIN_UID,
+      chat_id: adminChatId,
       text: `⚠️ 未找到消息映射关系，无法同步编辑到用户。\n\n可能原因：消息已过期（超过48小时）或机器人已重启。`
     });
   }

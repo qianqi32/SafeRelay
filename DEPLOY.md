@@ -124,12 +124,15 @@
 
 ## 步骤 4：激活 Webhook
 
-部署完成后，在浏览器访问以下 URL 来激活机器人（仅更改前面的域名 ）：
+部署完成后，使用 POST 请求激活机器人。请求头必须携带 `X-SafeRelay-Admin-Secret`，其值为 `ENV_BOT_SECRET`：
 
+```powershell
+Invoke-WebRequest -Method POST `
+  -Uri "https://<你的 worker 域名>/registerWebhook" `
+  -Headers @{ "X-SafeRelay-Admin-Secret" = "<ENV_BOT_SECRET>" }
 ```
-https://<你的 worker 域名>/registerWebhook
-```
-例如： `https://tgbot.example.workers.dev/registerWebhook`
+
+例如：`https://tgbot.example.workers.dev/registerWebhook`。不要在浏览器地址栏直接访问该接口，也不要将密钥写入 URL。
 
 ---
 
